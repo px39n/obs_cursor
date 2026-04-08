@@ -62,11 +62,28 @@ export class PreviewPanel {
   private vaultUri: vscode.Uri | null = null;
   private currentTitle: string | undefined;
 
-  static create(extensionUri: vscode.Uri, debugMode: boolean = false): PreviewPanel {
+  /**
+   * @param previewInSecondGroup When true (default), pin Markdown to editor group 1 and open the webview in group 2 so new files stay out of the preview group. When false, use {@link vscode.ViewColumn.Beside} (legacy behavior).
+   */
+  static async create(
+    extensionUri: vscode.Uri,
+    debugMode: boolean = false,
+    options: { previewInSecondGroup?: boolean } = {}
+  ): Promise<PreviewPanel> {
+    const previewInSecondGroup = options.previewInSecondGroup !== false;
+
     // Get all workspace folders and active editor's folder
     const workspaceFolders = vscode.workspace.workspaceFolders;
     const activeEditor = vscode.window.activeTextEditor;
-    
+
+    // Keep Markdown sources in column 1 so the preview opens in column 2
+    if (previewInSecondGroup && activeEditor?.document.languageId === "markdown") {
+      await vscode.window.showTextDocument(activeEditor.document, {
+        viewColumn: vscode.ViewColumn.One,
+        preserveFocus: true,
+      });
+    }
+
     // Collect all possible resource roots
     const resourceRoots: vscode.Uri[] = [extensionUri];
     
@@ -91,10 +108,11 @@ export class PreviewPanel {
     
     const vaultUri = workspaceFolders?.[0]?.uri || (activeEditor ? vscode.Uri.joinPath(activeEditor.document.uri, '..') : null);
     
+    const viewColumn = previewInSecondGroup ? vscode.ViewColumn.Two : vscode.ViewColumn.Beside;
     const panel = vscode.window.createWebviewPanel(
       PreviewPanel.viewType,
       debugMode ? "Obsidian Preview (Debug)" : "Obsidian Preview",
-      vscode.ViewColumn.Beside,
+      viewColumn,
       {
         enableScripts: true,
         retainContextWhenHidden: true,

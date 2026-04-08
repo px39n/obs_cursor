@@ -229,7 +229,9 @@ export function activate(context: vscode.ExtensionContext): void {
       previewPanel.dispose();
     }
     navigationStack.length = 0; // Reset history for new panel
-    previewPanel = PreviewPanel.create(ctx.extensionUri, debugMode);
+    const previewInSecondGroup =
+      vscode.workspace.getConfiguration("obsidianPreview").get<boolean>("previewInSecondEditorGroup") !== false;
+    previewPanel = await PreviewPanel.create(ctx.extensionUri, debugMode, { previewInSecondGroup });
     
     // Handle panel dispose
     previewPanel.onDispose(() => {
@@ -333,6 +335,13 @@ export function activate(context: vscode.ExtensionContext): void {
     logger.info(`Initial render: doc=${docToRender?.uri.fsPath ?? 'none'}, connected=${client.isConnected()}`);
     if (docToRender) {
       await updatePreview(docToRender);
+      if (previewInSecondGroup) {
+        try {
+          await vscode.window.showTextDocument(docToRender, { viewColumn: vscode.ViewColumn.One });
+        } catch {
+          /* keep preview focused if document tab is unavailable */
+        }
+      }
     }
   }
 
@@ -371,16 +380,19 @@ export function activate(context: vscode.ExtensionContext): void {
   // Watch for active editor changes
   const editorChangeDisposable = vscode.window.onDidChangeActiveTextEditor(
     async (editor) => {
-      if (
-        previewPanel &&
-        editor &&
-        editor.document.languageId === "markdown"
-      ) {
-        // Show loading immediately when switching files
-        const fileName = editor.document.uri.fsPath.split(/[/\\]/).pop()?.replace(/\.md$/i, '') || '';
-        previewPanel.showLoading(fileName);
-        await updatePreview(editor.document);
+      if (!editor || editor.document.languageId !== "markdown") {
+        return;
       }
+      const autoOpen = vscode.workspace.getConfiguration("obsidianPreview").get<boolean>("autoOpenPreview") !== false;
+      if (!previewPanel) {
+        if (autoOpen) {
+          await openPreviewPanel(context, false);
+        }
+        return;
+      }
+      const fileName = editor.document.uri.fsPath.split(/[/\\]/).pop()?.replace(/\.md$/i, '') || '';
+      previewPanel.showLoading(fileName);
+      await updatePreview(editor.document);
     }
   );
 
@@ -434,6 +446,13 @@ export function activate(context: vscode.ExtensionContext): void {
   autoDetectVault();
 
   logger.info("Extension activated");
+
+  // Restored window / already-active Markdown tab: open preview without requiring a tab switch
+  const autoOpenOnActivate =
+    vscode.workspace.getConfiguration("obsidianPreview").get<boolean>("autoOpenPreview") !== false;
+  if (autoOpenOnActivate && vscode.window.activeTextEditor?.document.languageId === "markdown") {
+    void openPreviewPanel(context, false);
+  }
 }
 
 async function updatePreview(document: vscode.TextDocument): Promise<void> {

@@ -109,6 +109,16 @@
           "type": "string",
           "default": "",
           "description": "Path to your Obsidian vault (auto-detected if left empty)"
+        },
+        "obsidianPreview.autoOpenPreview": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, opening or focusing a Markdown editor automatically opens the Obsidian preview (if not already open)."
+        },
+        "obsidianPreview.previewInSecondEditorGroup": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, keep Markdown in the first editor group and open the preview in the second group so new files from the explorer usually land beside the source, not the webview. Set false to use the previous “open beside active editor” behavior."
         }
       }
     }
