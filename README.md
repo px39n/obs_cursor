@@ -57,6 +57,23 @@ For manual installation, see the [Manual Installation Guide](INSTALL.md).
 | `Obsidian Preview: Update Obsidian Plugin` | Check for and install plugin updates |
 | `Obsidian Preview: Update Vault Path` | Change the detected vault path |
 
+### Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `obsidianPreview.autoOpenPreview` | `true` | Open the Obsidian preview when you focus a Markdown editor (including after a window reload with a note already open). |
+| `obsidianPreview.previewInSecondEditorGroup` | `true` | Keep the note in the **first** editor group and the preview in the **second**, so new files from the explorer open next to the source instead of stacking with the webview. Set to `false` for the previous “open beside active editor” behavior. |
+
+To further discourage new tabs from opening in the preview’s group, you can enable the editor auto-lock for this webview in your user `settings.json`:
+
+```json
+"workbench.editor.autoLockGroups": {
+  "obsidianPreview": true
+}
+```
+
+(Merge with any other `autoLockGroups` keys you already use.)
+
 ---
 
 ## Support
