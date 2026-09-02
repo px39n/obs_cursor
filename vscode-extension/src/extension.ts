@@ -40,7 +40,8 @@ let hoverProviderDisposable: vscode.Disposable | undefined;
 let linkProviderDisposable: vscode.Disposable | undefined;
 let completionProviderDisposable: vscode.Disposable | undefined;
 let previewPanel: PreviewPanel | undefined;
-const navigationStack: string[] = [];
+const backStack: string[] = [];
+const forwardStack: string[] = [];
 
 export function activate(context: vscode.ExtensionContext): void {
   const config = vscode.workspace.getConfiguration("obsidianPreview");
@@ -228,7 +229,8 @@ export function activate(context: vscode.ExtensionContext): void {
     if (previewPanel) {
       previewPanel.dispose();
     }
-    navigationStack.length = 0; // Reset history for new panel
+    backStack.length = 0;
+    forwardStack.length = 0;
     previewPanel = PreviewPanel.create(ctx.extensionUri, debugMode);
     
     // Handle panel dispose
@@ -248,16 +250,45 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // Handle back button click
     previewPanel.onNavigateBack(async () => {
-      if (navigationStack.length === 0) return;
-      const prevPath = navigationStack.pop()!;
-      previewPanel?.setCanGoBack(navigationStack.length > 0);
-      
+      if (backStack.length === 0) return;
+
+      const currentPath = previewPanel?.getCurrentFilePath();
+      if (currentPath) {
+        forwardStack.push(currentPath);
+      }
+
+      const prevPath = backStack.pop()!;
+      previewPanel?.setCanGoBack(backStack.length > 0);
+      previewPanel?.setCanGoForward(forwardStack.length > 0);
+
       try {
         const doc = await vscode.workspace.openTextDocument(prevPath);
         await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
         // Preview will update via onDidChangeActiveTextEditor
       } catch (err) {
         console.error("[Preview] Navigate back failed:", err);
+      }
+    });
+
+    // Handle forward button click
+    previewPanel.onNavigateForward(async () => {
+      if (forwardStack.length === 0) return;
+
+      const currentPath = previewPanel?.getCurrentFilePath();
+      if (currentPath) {
+        backStack.push(currentPath);
+      }
+
+      const nextPath = forwardStack.pop()!;
+      previewPanel?.setCanGoBack(backStack.length > 0);
+      previewPanel?.setCanGoForward(forwardStack.length > 0);
+
+      try {
+        const doc = await vscode.workspace.openTextDocument(nextPath);
+        await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+        // Preview will update via onDidChangeActiveTextEditor
+      } catch (err) {
+        console.error("[Preview] Navigate forward failed:", err);
       }
     });
 
@@ -658,8 +689,10 @@ async function handleLinkClick(targetPath: string): Promise<void> {
     || vscode.window.visibleTextEditors.find(e => e.document.languageId === "markdown")?.document.uri.fsPath;
 
   if (sourcePath) {
-    navigationStack.push(sourcePath);
+    backStack.push(sourcePath);
+    forwardStack.length = 0; // Clear forward history when following a new link
     previewPanel?.setCanGoBack(true);
+    previewPanel?.setCanGoForward(false);
   }
   
   // Use shared navigation logic

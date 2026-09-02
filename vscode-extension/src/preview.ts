@@ -4,6 +4,7 @@ type LinkClickCallback = (targetPath: string) => void;
 type HoverPreviewCallback = (targetPath: string) => Promise<{ html: string; css: string } | null>;
 type RefreshCallback = () => void;
 type NavigateBackCallback = () => void;
+type NavigateForwardCallback = () => void;
 type FocusObsidianCallback = () => void;
 
 export class PreviewPanel {
@@ -14,10 +15,12 @@ export class PreviewPanel {
   private hoverPreviewCallback: HoverPreviewCallback | null = null;
   private refreshCallbacks: RefreshCallback[] = [];
   private navigateBackCallbacks: NavigateBackCallback[] = [];
+  private navigateForwardCallbacks: NavigateForwardCallback[] = [];
   private focusObsidianCallbacks: FocusObsidianCallback[] = [];
   private disposeCallbacks: (() => void)[] = [];
   private debugMode: boolean = false;
   private canGoBack: boolean = false;
+  private canGoForward: boolean = false;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -49,6 +52,8 @@ export class PreviewPanel {
         this.refreshCallbacks.forEach((cb) => cb());
       } else if (message.type === "navigateBack") {
         this.navigateBackCallbacks.forEach((cb) => cb());
+      } else if (message.type === "navigateForward") {
+        this.navigateForwardCallbacks.forEach((cb) => cb());
       } else if (message.type === "focusObsidian") {
         this.focusObsidianCallbacks.forEach((cb) => cb());
       }
@@ -219,6 +224,10 @@ export class PreviewPanel {
     this.navigateBackCallbacks.push(callback);
   }
 
+  onNavigateForward(callback: NavigateForwardCallback): void {
+    this.navigateForwardCallbacks.push(callback);
+  }
+
   onFocusObsidian(callback: FocusObsidianCallback): void {
     this.focusObsidianCallbacks.push(callback);
   }
@@ -227,6 +236,11 @@ export class PreviewPanel {
     this.canGoBack = value;
     // Dynamically update back button visibility in the webview
     this.panel.webview.postMessage({ type: "updateBackButton", visible: value });
+  }
+
+  setCanGoForward(value: boolean): void {
+    this.canGoForward = value;
+    this.panel.webview.postMessage({ type: "updateForwardButton", visible: value });
   }
 
   onDispose(callback: () => void): void {
@@ -245,7 +259,8 @@ export class PreviewPanel {
     
     const titleBar = this.currentTitle ? `
     <div class="preview-title-bar">
-      <button id="back-btn" class="preview-back-btn${this.canGoBack ? '' : ' disabled'}" onclick="if(!this.classList.contains('disabled'))vscode.postMessage({type:'navigateBack'})" title="Go back">←</button>
+      <button id="back-btn" class="preview-nav-btn${this.canGoBack ? '' : ' disabled'}" onclick="if(!this.classList.contains('disabled'))vscode.postMessage({type:'navigateBack'})" title="Go back">←</button>
+      <button id="forward-btn" class="preview-nav-btn${this.canGoForward ? '' : ' disabled'}" onclick="if(!this.classList.contains('disabled'))vscode.postMessage({type:'navigateForward'})" title="Go forward">→</button>
       <span class="preview-title-icon">📄</span>
       <span class="preview-title-text">${this.currentTitle}</span>
       <button class="preview-refresh-btn" onclick="vscode.postMessage({type:'refresh'})" title="Refresh (restart render server)">Reload</button>
@@ -317,7 +332,7 @@ export class PreviewPanel {
       flex: 1;
     }
     
-    .preview-back-btn {
+    .preview-nav-btn {
       background: transparent;
       border: 1px solid var(--background-secondary);
       border-radius: 4px;
@@ -327,17 +342,17 @@ export class PreviewPanel {
       font-weight: bold;
       opacity: 0.7;
       transition: opacity 0.2s, background 0.2s, color 0.2s;
-      margin-right: 8px;
+      margin-right: 4px;
       color: var(--text-muted);
     }
     
-    .preview-back-btn:hover:not(.disabled) {
+    .preview-nav-btn:hover:not(.disabled) {
       opacity: 1;
       background: var(--background-secondary);
       color: var(--text-accent);
     }
     
-    .preview-back-btn.disabled {
+    .preview-nav-btn.disabled {
       opacity: 0.25;
       cursor: default;
     }
@@ -629,6 +644,15 @@ export class PreviewPanel {
         showHoverPreview(msg.html, msg.x, msg.y, msg.targetPath);
       } else if (msg.type === 'updateBackButton') {
         var btn = document.getElementById('back-btn');
+        if (btn) {
+          if (msg.visible) {
+            btn.classList.remove('disabled');
+          } else {
+            btn.classList.add('disabled');
+          }
+        }
+      } else if (msg.type === 'updateForwardButton') {
+        var btn = document.getElementById('forward-btn');
         if (btn) {
           if (msg.visible) {
             btn.classList.remove('disabled');
