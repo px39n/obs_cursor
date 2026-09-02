@@ -9,6 +9,7 @@ type FocusObsidianCallback = () => void;
 export class PreviewPanel {
   private static readonly viewType = "obsidianPreview";
   private readonly panel: vscode.WebviewPanel;
+  private currentFilePath: string | undefined;
   private linkClickCallbacks: LinkClickCallback[] = [];
   private hoverPreviewCallback: HoverPreviewCallback | null = null;
   private refreshCallbacks: RefreshCallback[] = [];
@@ -105,6 +106,14 @@ export class PreviewPanel {
     const previewPanel = new PreviewPanel(panel, extensionUri, debugMode);
     previewPanel.vaultUri = vaultUri || null;
     return previewPanel;
+  }
+
+  setCurrentFilePath(filePath: string | undefined): void {
+    this.currentFilePath = filePath;
+  }
+
+  getCurrentFilePath(): string | undefined {
+    return this.currentFilePath;
   }
 
   showLoading(title?: string): void {

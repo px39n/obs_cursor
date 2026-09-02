@@ -440,6 +440,7 @@ async function updatePreview(document: vscode.TextDocument): Promise<void> {
   if (!previewPanel || !client.isConnected()) return;
 
   const filePath = document.uri.fsPath;
+  previewPanel.setCurrentFilePath(filePath);
   const content = document.getText();
   // Extract filename without extension for title
   const fileName = filePath.split(/[/\\]/).pop()?.replace(/\.md$/i, '') || '';
@@ -646,15 +647,17 @@ async function promptCreateFile(fileName: string, sourcePath?: string): Promise<
 }
 
 async function handleLinkClick(targetPath: string): Promise<void> {
-  // Push current file to navigation stack before navigating
-  const currentEditor = vscode.window.activeTextEditor;
-  if (currentEditor && currentEditor.document.languageId === "markdown") {
-    navigationStack.push(currentEditor.document.uri.fsPath);
+  const sourcePath = previewPanel?.getCurrentFilePath()
+    || vscode.window.activeTextEditor?.document.uri.fsPath
+    || vscode.window.visibleTextEditors.find(e => e.document.languageId === "markdown")?.document.uri.fsPath;
+
+  if (sourcePath) {
+    navigationStack.push(sourcePath);
     previewPanel?.setCanGoBack(true);
   }
   
   // Use shared navigation logic
-  await navigateToWikilink(targetPath, currentEditor?.document.uri.fsPath);
+  await navigateToWikilink(targetPath, sourcePath);
 }
 
 // ─── Auto-Launch Obsidian ───
