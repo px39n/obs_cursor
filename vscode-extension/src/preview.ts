@@ -239,7 +239,7 @@ export class PreviewPanel {
       <button id="back-btn" class="preview-back-btn${this.canGoBack ? '' : ' disabled'}" onclick="if(!this.classList.contains('disabled'))vscode.postMessage({type:'navigateBack'})" title="Go back">←</button>
       <span class="preview-title-icon">📄</span>
       <span class="preview-title-text">${this.currentTitle}</span>
-      <button class="preview-refresh-btn" onclick="vscode.postMessage({type:'refresh'})" title="Refresh (restart render server)">🔄</button>
+      <button class="preview-refresh-btn" onclick="vscode.postMessage({type:'refresh'})" title="Refresh (restart render server)">Reload</button>
     </div>` : '';
     
     return `<!DOCTYPE html>
@@ -248,14 +248,25 @@ export class PreviewPanel {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
-    /* Base styles - white background by default */
+    /* Base styles - Map VS Code theme variables to Obsidian CSS variables */
     :root {
-      --background-primary: #ffffff;
-      --background-secondary: #f5f5f5;
-      --text-normal: #333333;
-      --text-muted: #666666;
-      --text-accent: #0969da;
-      --interactive-accent: #0550ae;
+      --background-primary: var(--vscode-editor-background, #ffffff);
+      --background-secondary: var(--vscode-sideBar-background, #f5f5f5);
+      --text-normal: var(--vscode-editor-foreground, #333333);
+      --text-muted: var(--vscode-descriptionForeground, #666666);
+      --text-accent: var(--vscode-textLink-foreground, #0969da);
+      --interactive-accent: var(--vscode-textLink-activeForeground, #0550ae);
+      --hr-color: var(--vscode-settings-dropdownListBorder, #e1e4e8);
+    }
+
+    /* Target VS Code Dark Themes */
+    body.vscode-dark, body.vscode-high-contrast {
+      --background-primary: var(--vscode-editor-background, #1e1e1e);
+      --background-secondary: var(--vscode-sideBar-background, #252526);
+      --text-normal: var(--vscode-editor-foreground, #cccccc);
+      --text-muted: var(--vscode-descriptionForeground, #858585);
+      --text-accent: var(--vscode-textLink-foreground, #3794ff);
+      --interactive-accent: var(--vscode-textLink-activeForeground, #3794ff);
     }
     
     html, body {
@@ -330,6 +341,7 @@ export class PreviewPanel {
       padding: 4px 8px;
       font-size: 14px;
       opacity: 0.6;
+      color: var(--text-normal);
       transition: opacity 0.2s;
     }
     
@@ -402,9 +414,10 @@ export class PreviewPanel {
       position: fixed;
       display: none;
       background: var(--background-primary);
-      border: 1px solid #ccc;
+      color: var(--text-normal);
+      border: 1px solid var(--background-secondary);
       border-radius: 6px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      box-shadow: 0 4px 12px rgb(0 0 0 / 0.15);
       max-width: 400px;
       max-height: 300px;
       overflow: auto;
@@ -417,7 +430,7 @@ export class PreviewPanel {
       font-weight: bold;
       margin-bottom: 8px;
       padding-bottom: 8px;
-      border-bottom: 1px solid #eee;
+      border-bottom: 1px solid var(--background-secondary);
     }
     
     ${css}
@@ -439,7 +452,7 @@ export class PreviewPanel {
     }
   </style>
 </head>
-<body class="theme-light">
+<body>
   ${debugPanel}
   ${titleBar}
   <div class="preview-content">
@@ -451,6 +464,15 @@ export class PreviewPanel {
   <script>
     const vscode = acquireVsCodeApi();
     const isDebugMode = ${this.debugMode};
+
+    // Dynamically sync Obsidian theme class based on VS Code's theme
+    if (document.body.classList.contains('vscode-dark') || document.body.classList.contains('vscode-high-contrast')) {
+      document.body.classList.add('theme-dark');
+      document.body.classList.remove('theme-light');
+    } else {
+      document.body.classList.add('theme-light');
+      document.body.classList.remove('theme-dark');
+    }
     
     // Handle Admonition/Callout collapse
     function toggleAdmonition(container) {

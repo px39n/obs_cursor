@@ -56,5 +56,5 @@ If you see the rendered preview, everything is working!
 | ---------------------- | -------------------------------------------------------------- |
 | "No Vault Configured"  | Run `Obsidian Preview: Update Vault Path` to set it          |
 | "Connection Timed Out" | Make sure the Cursor Integration plugin is enabled in Obsidian |
-| Preview not updating   | Close and reopen the preview panel, or click the 🔄 button     |
+| Preview not updating   | Close and reopen the preview panel, or click the reload button     |
 | Links not working      | Ensure the file exists in your vault                           |
