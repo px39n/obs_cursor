@@ -54,6 +54,8 @@ export class PreviewPanel {
         this.navigateBackCallbacks.forEach((cb) => cb());
       } else if (message.type === "navigateForward") {
         this.navigateForwardCallbacks.forEach((cb) => cb());
+      } else if (message.type === "openExternal") {
+        vscode.env.openExternal(vscode.Uri.parse(message.url));
       } else if (message.type === "focusObsidian") {
         this.focusObsidianCallbacks.forEach((cb) => cb());
       }
@@ -626,8 +628,12 @@ export class PreviewPanel {
           return;
         }
         
-        if (targetPath && targetPath.indexOf('http') !== 0) {
-          vscode.postMessage({ type: 'linkClick', targetPath: targetPath });
+        if (targetPath) {
+          if (targetPath.indexOf('http') === 0) {
+            vscode.postMessage({ type: 'openExternal', url: targetPath });
+          } else {
+            vscode.postMessage({ type: 'linkClick', targetPath: targetPath });
+          }
         }
       }
     });
