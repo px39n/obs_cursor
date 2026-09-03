@@ -231,11 +231,14 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     backStack.length = 0;
     forwardStack.length = 0;
-    previewPanel = PreviewPanel.create(ctx.extensionUri, debugMode);
+    const panel = PreviewPanel.create(ctx.extensionUri, debugMode);
+    previewPanel = panel;
     
     // Handle panel dispose
-    previewPanel.onDispose(() => {
-      previewPanel = undefined;
+    panel.onDispose(() => {
+      if (previewPanel === panel) {
+        previewPanel = undefined;
+      }
     });
 
     // Handle link clicks
