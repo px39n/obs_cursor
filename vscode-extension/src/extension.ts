@@ -376,7 +376,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const fileName = filePath.split(/[/\\]/).pop() || '';
       logger.debug(`Render request for: ${fileName}`);
       try {
-        const result = await client.render(filePath, content);
+        const result = await renderDocumentContent(filePath, content);
         // Extract filename without extension for title
         const titleName = fileName.replace(/\.md$/i, '');
         previewPanel.updateContent(result.html, result.css, titleName);
@@ -412,10 +412,7 @@ export function activate(context: vscode.ExtensionContext): void {
       ) {
         const currentPath = editor.document.uri.fsPath;
         
-        // 🟢 GUARD: Do nothing if we are already displaying this file!
-        if (currentPath === previewPanel.getCurrentFilePath()) {
-          return;
-        }
+        if (currentPath === previewPanel.getCurrentFilePath()) return;
 
         const fileName = currentPath.split(/[/\\]/).pop()?.replace(/\.md$/i, '') || '';
         previewPanel.showLoading(fileName);
@@ -476,6 +473,43 @@ export function activate(context: vscode.ExtensionContext): void {
   logger.info("Extension activated");
 }
 
+async function renderDocumentContent(filePath: string, content: string): Promise<{ html: string; css: string }> {
+  // Pre-convert markdown `![alt](data:image/...)` to HTML `<img src="..." alt="...">`
+  const contentWithHtmlImages = content.replace(
+    /!\[([^\]]*)\]\((data:image\/[a-zA-Z0-9+-]+;base64,[a-zA-Z0-9+/=]+)\)/g,
+    (match, alt, dataUri) => `<img src="${dataUri}" alt="${alt}" />`
+  );
+
+  // Swap base64 data URIs with short placeholders before sending over WebSocket
+  const dataUriMap = new Map<string, string>();
+  let placeholderCount = 0;
+
+  const sanitizedContent = contentWithHtmlImages.replace(
+    /data:image\/[a-zA-Z0-9+-]+;base64,[a-zA-Z0-9+/=]+/g,
+    (dataUri) => {
+      const key = `__DATA_URI_PLACEHOLDER_${placeholderCount++}__`;
+      dataUriMap.set(key, dataUri);
+      return key;
+    }
+  );
+
+  // Send lightweight content over WebSocket
+  const result = await client.render(filePath, sanitizedContent);
+
+  // Restore original base64 image strings into the rendered HTML
+  let finalHtml = result.html;
+  dataUriMap.forEach((dataUri, key) => {
+    const found = finalHtml.includes(key);
+    if (found) {
+      const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      finalHtml = finalHtml.replace(new RegExp(escapedKey, 'g'), () => dataUri);
+      const stillHasKey = finalHtml.includes(key);
+    }
+  });
+
+  return { html: finalHtml, css: result.css };
+}
+
 async function updatePreview(document: vscode.TextDocument): Promise<void> {
   if (!previewPanel || !client.isConnected()) return;
 
@@ -484,9 +518,9 @@ async function updatePreview(document: vscode.TextDocument): Promise<void> {
   const content = document.getText();
   // Extract filename without extension for title
   const fileName = filePath.split(/[/\\]/).pop()?.replace(/\.md$/i, '') || '';
-  
+
   try {
-    const result = await client.render(filePath, content);
+    const result = await renderDocumentContent(filePath, content);
     previewPanel.updateContent(result.html, result.css, fileName);
   } catch (err) {
     console.error("[Preview] Render failed:", err);

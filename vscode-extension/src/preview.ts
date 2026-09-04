@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as path from "path";
 
 type LinkClickCallback = (targetPath: string) => void;
 type HoverPreviewCallback = (targetPath: string) => Promise<{ html: string; css: string } | null>;
@@ -71,7 +72,7 @@ export class PreviewPanel {
   private currentTitle: string | undefined;
 
   static create(extensionUri: vscode.Uri, debugMode: boolean = false): PreviewPanel {
-    // Get all workspace folders and active editor's folder
+// Get all workspace folders and active editor's folder
     const workspaceFolders = vscode.workspace.workspaceFolders;
     const activeEditor = vscode.window.activeTextEditor;
     
@@ -83,11 +84,11 @@ export class PreviewPanel {
       workspaceFolders.forEach(folder => resourceRoots.push(folder.uri));
     }
     
-    // Add active file's directory (vault might be here)
+// Add active file's directory (vault might be here)
     if (activeEditor) {
       const fileDir = vscode.Uri.joinPath(activeEditor.document.uri, '..');
       resourceRoots.push(fileDir);
-      // Also add parent directories up to drive root (to cover vault root)
+// Also add parent directories up to drive root (to cover vault root)
       let parent = fileDir;
       for (let i = 0; i < 10; i++) {
         const newParent = vscode.Uri.joinPath(parent, '..');
@@ -148,64 +149,126 @@ export class PreviewPanel {
     }
     
     // Convert local image paths to webview URIs
-    const processedHtml = this.processLocalImages(html);
+    const processedHtml = this.processLocalImages(html, this.currentFilePath);
     this.panel.webview.html = this.getWebviewContent(processedHtml, css);
   }
   
   /**
    * Convert local image paths to webview-compatible URIs
    */
-  private processLocalImages(html: string): string {
-    if (!this.vaultUri) {
-      console.log("[Preview] No vaultUri, skipping image processing");
-      return html;
-    }
-    
+  private processLocalImages(html: string, noteFilePath?: string): string {
+    if (!this.vaultUri) return html;
+
     const webview = this.panel.webview;
     const vaultPath = this.vaultUri.fsPath;
-    
-    console.log("[Preview] Processing images, vaultPath:", vaultPath);
-    
-    // Match src attributes with various patterns
-    return html.replace(
-      /src=["']([^"']+)["']/g,
-      (match, src) => {
-        console.log("[Preview] Found src:", src);
-        
-        // Skip data URIs and external URLs
-        if (src.startsWith('data:') || src.startsWith('http://') || src.startsWith('https://')) {
-          return match;
+    const noteDir = noteFilePath ? path.dirname(noteFilePath) : vaultPath;
+
+    const isImage = (url: string) => {
+      const lower = url.toLowerCase().split('?')[0].split('#')[0];
+      return lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') ||
+             lower.endsWith('.gif') || lower.endsWith('.webp') || lower.endsWith('.svg') ||
+             lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('data:');
+    };
+
+    const parseSizeStyle = (altText: string, existingWidth?: string, existingHeight?: string): string => {
+      let width = existingWidth;
+      let height = existingHeight;
+
+      if (altText) {
+        const parts = altText.split('|');
+        const lastPart = parts[parts.length - 1].trim();
+        const match = lastPart.match(/^(\d+)(?:x(\d+))?$/);
+        if (match) {
+          width = match[1];
+          if (match[2]) height = match[2];
         }
+      }
+
+      let style = "";
+      if (width) style += `width:${width}px !important;`;
+      if (height) style += `height:${height}px !important;`;
+      if (!height && width) style += `height:auto;`;
+      return style;
+    };
+    
+    // Safely append 'internal-embed-image'
+    const addClass = (attrs: string, className: string): string => {
+      const classMatch = attrs.match(/class=["']([^"']*)["']/i);
+      if (classMatch) {
+        const currentClasses = classMatch[1].split(/\s+/).filter(Boolean);
+        if (!currentClasses.includes(className)) {
+          currentClasses.push(className);
+        }
+        return attrs.replace(/class=["'][^"']*["']/i, `class="${currentClasses.join(' ')}"`);
+      } else {
+        return `class="${className}" ${attrs}`;
+      }
+    };
+
+    let transformedHtml = html.replace(
+      /<span\s+[^>]*class=["'][^"']*internal-embed[^"']*["'][^>]*>/gi,
+      (spanTag) => {
+        const srcMatch = spanTag.match(/src=["']([^"']+)["']/i);
+        const altMatch = spanTag.match(/alt=["']([^"']+)["']/i) || spanTag.match(/width=["']([^"']+)["']/i);
+        const src = srcMatch ? srcMatch[1] : "";
+        const alt = altMatch ? altMatch[1] : "";
+
+        if (src && isImage(src)) {
+          const sizeStyle = parseSizeStyle(alt);
+          return `<img class="internal-embed-image" style="max-width:100%;${sizeStyle}" alt="${alt}" src="${src}" `;
+        }
+        return spanTag;
+      }
+    );
+
+    return transformedHtml.replace(
+      /<img\s+([^>]*src=["']([^"']+)["'][^>]*)>/gi,
+      (imgTag, fullAttrs, src) => {
+        const altMatch = fullAttrs.match(/alt=["']([^"']+)["']/i);
+        const widthMatch = fullAttrs.match(/width=["']([^"']+)["']/i);
+        const heightMatch = fullAttrs.match(/height=["']([^"']+)["']/i);
+
+        const alt = altMatch ? altMatch[1] : "";
+        const w = widthMatch ? widthMatch[1] : undefined;
+        const h = heightMatch ? heightMatch[1] : undefined;
+
+        const sizeStyle = parseSizeStyle(alt, w, h);
         
-        // Handle app:// protocol (Obsidian internal)
-        if (src.startsWith('app://')) {
-          // Extract the path after app://xxx/
-          const pathMatch = src.match(/app:\/\/[^/]+\/(.+)/);
+        // Clean up
+        let cleanSrc = src.replace(/^file:\/\/\/?/i, '');
+        cleanSrc = cleanSrc.replace(/\\/g, '/');
+
+        let newSrc = src;
+
+        if (cleanSrc.startsWith('data:') || cleanSrc.startsWith('http://') || cleanSrc.startsWith('https://')) {
+          newSrc = cleanSrc;
+        } else if (cleanSrc.startsWith('app://')) {
+                    const pathMatch = cleanSrc.match(/app:\/\/[^/]+\/(.+)/);
           if (pathMatch) {
             let filePath = decodeURIComponent(pathMatch[1]);
-            // Remove query string (e.g., ?1738439523304)
-            const queryIndex = filePath.indexOf('?');
-            if (queryIndex !== -1) {
-              filePath = filePath.substring(0, queryIndex);
+                        const queryIndex = filePath.indexOf('?');
+            if (queryIndex !== -1) filePath = filePath.substring(0, queryIndex);
+            filePath = filePath.replace(/^file:\/\/\/?/i, '');
+            newSrc = webview.asWebviewUri(vscode.Uri.file(filePath)).toString();
+          }
+        } else {
+          try {
+            let absolutePath: string;
+            if (path.isAbsolute(cleanSrc) || /^[a-zA-Z]:\//.test(cleanSrc)) {
+              absolutePath = path.normalize(cleanSrc);
+            } else {
+              absolutePath = path.resolve(noteDir, cleanSrc);
             }
-            console.log("[Preview] app:// path converted to:", filePath);
-            const fileUri = vscode.Uri.file(filePath);
-            const webviewUri = webview.asWebviewUri(fileUri);
-            return `src="${webviewUri}"`;
+            newSrc = webview.asWebviewUri(vscode.Uri.file(absolutePath)).toString();
+          } catch {
+            newSrc = src;
           }
         }
-        
-        // Handle relative paths
-        try {
-          const absolutePath = src.startsWith('/') ? src : `${vaultPath}/${src}`;
-          console.log("[Preview] Relative path converted to:", absolutePath);
-          const fileUri = vscode.Uri.file(absolutePath);
-          const webviewUri = webview.asWebviewUri(fileUri);
-          return `src="${webviewUri}"`;
-        } catch (err) {
-          console.log("[Preview] Error processing image:", err);
-          return match;
-        }
+
+        const attrsWithClass = addClass(fullAttrs, 'internal-embed-image');
+        const attrsWithNewSrc = attrsWithClass.replace(/src=["'][^"']+["']/i, `src="${newSrc}"`);
+
+        return `<img ${attrsWithNewSrc} style="max-width:100%;${sizeStyle}" />`;
       }
     );
   }
@@ -433,6 +496,12 @@ export class PreviewPanel {
     
     .internal-embed {
       margin: 8px 0 !important;
+    }
+
+    /* Image embeds & standalone image alignment */
+    .internal-embed-image {
+      display: inline-block !important;
+      vertical-align: middle;
     }
     
     /* Hover preview popup */
