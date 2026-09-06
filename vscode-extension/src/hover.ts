@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
+import { findAnchorInLines, findWikilinkFile } from "./wikilink";
 
 /**
  * Provides hover preview for wikilinks in the editor.
@@ -84,57 +85,70 @@ export class WikilinkHoverProvider implements vscode.HoverProvider {
     currentDocument: vscode.TextDocument,
     linkTarget: string
   ): Promise<vscode.MarkdownString | null> {
-    // Skip same-file anchors
-    if (linkTarget.startsWith("#")) {
+    // FIX: Guard decodeURIComponent against malformed URI sequences
+    let cleanTarget = linkTarget;
+    try {
+      cleanTarget = decodeURIComponent(linkTarget).trim();
+    } catch {
+      cleanTarget = linkTarget.trim();
+    }
+
+    let filePart = cleanTarget;
+    let anchorPart = "";
+    const hashIndex = cleanTarget.indexOf("#");
+    if (hashIndex !== -1) {
+      filePart = cleanTarget.substring(0, hashIndex).trim();
+      anchorPart = cleanTarget.substring(hashIndex + 1).trim();
+    }
+
+    let filePath: string;
+
+    // Allow same-file preview if an anchor is specified, otherwise skip
+    if (!filePart) {
+      filePath = currentDocument.uri.fsPath;
+    } else {
+      // Search for target workspace file using findWikilinkFile
+      const target = await findWikilinkFile(filePart);
+
+      if (!target) {
+        return new vscode.MarkdownString(`*File not found: ${linkTarget}*`);
+      }
+      filePath = target.fsPath;
+    }
+
+    // Skip preview if pointing to current document without an anchor
+    if (filePath.toLowerCase() === currentDocument.uri.fsPath.toLowerCase() && !anchorPart) {
       return null;
     }
-    
-    // Add .md extension if not present
-    let searchPath = linkTarget.split("#")[0]; // Remove anchor part
-    if (!searchPath) {
-      return null; // Only anchor, no file part
-    }
-    if (!searchPath.endsWith(".md")) {
-      searchPath = searchPath + ".md";
-    }
-    
-    // Search for the file
-    let files = await vscode.workspace.findFiles(`**/${searchPath}`);
-    
-    if (files.length === 0) {
-      // Try just the filename
-      const filename = searchPath.split("/").pop() || searchPath;
-      files = await vscode.workspace.findFiles(`**/${filename}`);
-    }
-    
-    if (files.length === 0) {
-      return new vscode.MarkdownString(`*File not found: ${linkTarget}*`);
-    }
-    
-    const filePath = files[0].fsPath;
-    
-    // Skip if linking to current file
-    if (filePath === currentDocument.uri.fsPath) {
-      return null;
-    }
-    
+
     try {
       const content = fs.readFileSync(filePath, "utf8");
       const lines = content.split("\n");
-      
-      // Get first 20 lines for preview
-      const previewLines = lines.slice(0, 20);
-      let previewContent = previewLines.join("\n");
-      
-      if (lines.length > 20) {
-        previewContent += "\n\n*... (truncated)*";
+
+      let startLine = 0;
+      if (anchorPart) {
+        const matchedLine = findAnchorInLines(lines, anchorPart);
+        if (matchedLine !== null) {
+          startLine = matchedLine;
+        }
       }
-      
+
+      // Extract up to 30 lines starting from anchor position for preview
+      const endLine = Math.min(lines.length, startLine + 30);
+      const previewLines = lines.slice(startLine, endLine);
+      let previewContent = previewLines.join("\n").trim();
+
+      if (startLine > 0) {
+        previewContent = "*... (above omitted)*\n\n" + previewContent;
+      }
+      if (endLine < lines.length) {
+        previewContent += "\n\n*... (below omitted)*";
+      }
+
+      const title = `**${path.basename(filePath, ".md")}${anchorPart ? " > " + anchorPart : ""}**`;
       const md = new vscode.MarkdownString();
-      md.appendMarkdown(`**${path.basename(filePath)}**\n\n---\n\n`);
-      md.appendMarkdown(previewContent);
+      md.appendMarkdown(`${title}\n\n---\n\n${previewContent}`);
       md.isTrusted = true;
-      
       return md;
     } catch (err) {
       return new vscode.MarkdownString(`*Error reading file: ${err}*`);

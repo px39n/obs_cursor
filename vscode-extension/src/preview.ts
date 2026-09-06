@@ -22,6 +22,22 @@ export class PreviewPanel {
   private debugMode: boolean = false;
   private canGoBack: boolean = false;
   private canGoForward: boolean = false;
+  private pendingAnchor: string | undefined;
+  private currentAnchor: string | undefined;
+
+  setPendingAnchor(anchor: string | undefined): void {
+    this.pendingAnchor = anchor;
+  }
+
+  consumePendingAnchor(): string | undefined {
+    const anchor = this.pendingAnchor;
+    this.pendingAnchor = undefined;
+    return anchor;
+  }
+
+  scrollToAnchor(anchor: string): void {
+    this.panel.webview.postMessage({ type: "scrollToAnchor", anchor });
+  }
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -135,8 +151,9 @@ export class PreviewPanel {
     this.panel.webview.html = this.getWebviewContent(loadingHtml, "");
   }
 
-  updateContent(html: string, css: string, title?: string): void {
+  updateContent(html: string, css: string, title?: string, anchor?: string): void {
     this.currentTitle = title;
+    this.currentAnchor = anchor;
     // Debug: log HTML size
     if (this.debugMode) {
       console.log(`[Preview] Received HTML: ${html.length} chars`);
@@ -150,13 +167,18 @@ export class PreviewPanel {
     
     // Convert local image paths to webview URIs
     const processedHtml = this.processLocalImages(html, this.currentFilePath);
-    this.panel.webview.html = this.getWebviewContent(processedHtml, css);
+    this.panel.webview.html = this.getWebviewContent(processedHtml, css, anchor);
+
+    if (anchor) {
+      setTimeout(() => this.scrollToAnchor(anchor), 150);
+      setTimeout(() => this.scrollToAnchor(anchor), 500);
+    }
   }
   
   /**
    * Convert local image paths to webview-compatible URIs
    */
-  private processLocalImages(html: string, noteFilePath?: string): string {
+  public processLocalImages(html: string, noteFilePath?: string): string {
     if (!this.vaultUri) return html;
 
     const webview = this.panel.webview;
@@ -316,7 +338,7 @@ export class PreviewPanel {
     this.panel.dispose();
   }
 
-  private getWebviewContent(html: string, css: string): string {
+  private getWebviewContent(html: string, css: string, anchor?: string): string {
     const debugPanel = this.debugMode ? `
     <div id="debug-panel" style="position:fixed;top:0;left:0;right:0;background:#ffeb3b;color:#000;padding:10px;font-family:monospace;font-size:12px;z-index:9999;border-bottom:2px solid #f57c00;">
       Debug Mode: Click anywhere to see element info
@@ -559,6 +581,97 @@ export class PreviewPanel {
   <script>
     const vscode = acquireVsCodeApi();
     const isDebugMode = ${this.debugMode};
+    const initialAnchor = ${JSON.stringify(anchor || "")};
+
+    function scrollToAnchor(rawAnchor) {
+      if (!rawAnchor) {
+        return;
+      }
+
+      var decoded = decodeURIComponent(rawAnchor).trim();
+      var cleanAnchor = decoded.replace(/^#+/, '').trim();
+
+      if (!cleanAnchor) {
+        return;
+      }
+
+      var anchorLower = cleanAnchor.toLowerCase();
+      var anchorSlug = anchorLower.replace(/\\s+/g, '-');
+      var anchorNoPunct = anchorLower.replace(/[-_]+/g, ' ').replace(/[^\\w\\s\\u4e00-\\u9fa5]/g, '').trim();
+
+      // Locate and scroll to element by ID, data-heading attribute, or heading text matching anchor
+      var el = null;
+
+      var byId = document.getElementById(cleanAnchor) ||
+                 document.getElementById(anchorSlug) ||
+                 document.getElementById(anchorLower);
+      if (byId) {
+        el = byId;
+      }
+
+      if (!el) {
+        var allDataHeadings = document.querySelectorAll('[data-heading]');
+        for (var i = 0; i < allDataHeadings.length; i++) {
+          var dh = allDataHeadings[i].getAttribute('data-heading');
+          if (dh) {
+            var dhLower = dh.trim().toLowerCase();
+            var dhSlug = dhLower.replace(/\\s+/g, '-');
+            var dhNoPunct = dhLower.replace(/[-_]+/g, ' ').replace(/[^\\w\\s\\u4e00-\\u9fa5]/g, '').trim();
+            if (dhLower === anchorLower || dhSlug === anchorSlug || dhNoPunct === anchorNoPunct) {
+              el = allDataHeadings[i];
+              break;
+            }
+          }
+        }
+      }
+
+      if (!el) {
+        var headings = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
+        for (var j = 0; j < headings.length; j++) {
+          var h = headings[j];
+          var rawHText = (h.textContent || '').trim();
+          var hText = rawHText.toLowerCase();
+          var hSlug = hText.replace(/\\s+/g, '-');
+          var hNoPunct = hText.replace(/[-_]+/g, ' ').replace(/[^\\w\\s\\u4e00-\\u9fa5]/g, '').trim();
+
+          if (!el) {
+            if (hText === anchorLower || hSlug === anchorSlug || hNoPunct === anchorNoPunct || hText.indexOf(anchorLower) !== -1) {
+              el = h;
+            }
+          }
+        }
+      }
+
+      if (!el) {
+        if (isDebugMode) {
+          updateDebug('Anchor not found in preview: ' + cleanAnchor);
+        }
+        return;
+      }
+
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      if (isDebugMode) {
+        updateDebug('Scrolled preview to anchor: ' + cleanAnchor);
+      }
+
+      var container = document.querySelector('.preview-content');
+      if (!container) {
+        return;
+      }
+
+      var elRectBefore = el.getBoundingClientRect();
+      var containerRect = container.getBoundingClientRect();
+      var currentScroll = container.scrollTop;
+
+      var targetScrollCenter = currentScroll + (elRectBefore.top - containerRect.top) - (containerRect.height / 2) + (elRectBefore.height / 2);
+
+      container.scrollTo({ top: Math.max(0, targetScrollCenter), behavior: 'smooth' });
+    }
+
+    if (initialAnchor) {
+      setTimeout(function() { scrollToAnchor(initialAnchor); }, 100);
+      setTimeout(function() { scrollToAnchor(initialAnchor); }, 450);
+    }
 
     // Dynamically sync Obsidian theme class based on VS Code's theme
     if (document.body.classList.contains('vscode-dark') || document.body.classList.contains('vscode-high-contrast')) {
@@ -671,36 +784,13 @@ export class PreviewPanel {
                      '" → targetPath="' + targetPath + '"');
         }
         
-        // Handle same-file anchor links (scroll within preview)
-        if (targetPath && targetPath.startsWith('#')) {
-          var anchorName = targetPath.substring(1).toLowerCase().replace(/-/g, ' ');
-          // Find matching heading in preview
-          var headings = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
-          for (var i = 0; i < headings.length; i++) {
-            var h = headings[i];
-            var headingText = (h.textContent || '').toLowerCase().trim();
-            if (headingText === anchorName || headingText.replace(/\\s+/g, '-') === targetPath.substring(1).toLowerCase()) {
-              h.scrollIntoView({ behavior: 'smooth', block: 'start' });
-              if (isDebugMode) {
-                updateDebug('Scrolled to heading: ' + h.textContent);
-              }
-              // Also notify extension to scroll editor
-              vscode.postMessage({ type: 'linkClick', targetPath: targetPath });
-              return;
-            }
-          }
-          if (isDebugMode) {
-            updateDebug('Heading not found in preview: ' + anchorName);
-          }
-          // Still notify extension even if not found in preview
-          vscode.postMessage({ type: 'linkClick', targetPath: targetPath });
-          return;
-        }
-        
         if (targetPath) {
           if (targetPath.indexOf('http') === 0) {
             vscode.postMessage({ type: 'openExternal', url: targetPath });
           } else {
+            if (targetPath.startsWith('#')) {
+              scrollToAnchor(targetPath.substring(1));
+            }
             vscode.postMessage({ type: 'linkClick', targetPath: targetPath });
           }
         }
@@ -715,7 +805,9 @@ export class PreviewPanel {
     // Listen for messages from extension
     window.addEventListener('message', function(e) {
       var msg = e.data;
-      if (msg.type === 'hoverPreviewResult') {
+      if (msg.type === 'scrollToAnchor') {
+        scrollToAnchor(msg.anchor);
+      } else if (msg.type === 'hoverPreviewResult') {
         showHoverPreview(msg.html, msg.x, msg.y, msg.targetPath);
       } else if (msg.type === 'updateBackButton') {
         var btn = document.getElementById('back-btn');
@@ -784,13 +876,12 @@ export class PreviewPanel {
       currentHoverLink = null;
     }
     
-    // Add hover listeners to links
-    document.body.addEventListener('mouseenter', function(e) {
-      var link = e.target.closest('a.internal-link, a[data-href]');
+    // Add hover listeners to links (FIX: Use mouseover/mouseout which bubble)
+    document.body.addEventListener('mouseover', function(e) {
+      var link = e.target.closest('a.internal-link, a[data-href], a[href]');
       if (link && link !== currentHoverLink) {
         currentHoverLink = link;
         
-        // Delay before showing preview
         clearTimeout(hoverTimeout);
         hoverTimeout = setTimeout(function() {
           var targetPath = link.getAttribute('data-href') || link.getAttribute('href');
@@ -807,16 +898,16 @@ export class PreviewPanel {
       }
     }, true);
     
-    document.body.addEventListener('mouseleave', function(e) {
-      var link = e.target.closest('a.internal-link, a[data-href]');
+    document.body.addEventListener('mouseout', function(e) {
+      var link = e.target.closest('a.internal-link, a[data-href], a[href]');
       if (link) {
         clearTimeout(hoverTimeout);
-        // Delay before hiding to allow moving to preview
+        // Delay before hiding to allow moving pointer into preview popup
         setTimeout(function() {
-          if (!hoverPreview.matches(':hover')) {
+          if (hoverPreview && !hoverPreview.matches(':hover')) {
             hideHoverPreview();
           }
-        }, 100);
+        }, 150);
       }
     }, true);
     
