@@ -39,6 +39,21 @@ export class PreviewPanel {
     this.panel.webview.postMessage({ type: "scrollToAnchor", anchor });
   }
 
+  // ADD THIS METHOD:
+  updateTheme(themeKind: vscode.ColorThemeKind): void {
+    const isDark =
+      themeKind === vscode.ColorThemeKind.Dark ||
+      themeKind === vscode.ColorThemeKind.HighContrast;
+    this.panel.webview.postMessage({
+      type: "themeChanged",
+      isDark: isDark,
+    });
+  }
+
+  postMessage(message: any): void {
+    this.panel.webview.postMessage(message);
+  }
+
   private constructor(
     panel: vscode.WebviewPanel,
     _extensionUri: vscode.Uri,
@@ -339,6 +354,13 @@ export class PreviewPanel {
   }
 
   private getWebviewContent(html: string, css: string, anchor?: string): string {
+    // Detect VS Code active color theme directly
+    const themeKind = vscode.window.activeColorTheme.kind;
+    const isDark =
+      themeKind === vscode.ColorThemeKind.Dark ||
+      themeKind === vscode.ColorThemeKind.HighContrast;
+    const themeClass = isDark ? "theme-dark vscode-dark" : "theme-light vscode-light";
+
     const debugPanel = this.debugMode ? `
     <div id="debug-panel" style="position:fixed;top:0;left:0;right:0;background:#ffeb3b;color:#000;padding:10px;font-family:monospace;font-size:12px;z-index:9999;border-bottom:2px solid #f57c00;">
       Debug Mode: Click anywhere to see element info
@@ -350,7 +372,7 @@ export class PreviewPanel {
       <button id="forward-btn" class="preview-nav-btn${this.canGoForward ? '' : ' disabled'}" onclick="if(!this.classList.contains('disabled'))vscode.postMessage({type:'navigateForward'})" title="Go forward">→</button>
       <span class="preview-title-icon">📄</span>
       <span class="preview-title-text">${this.currentTitle}</span>
-      <button class="preview-refresh-btn" onclick="vscode.postMessage({type:'refresh'})" title="Refresh (restart render server)">Reload</button>
+      <button id="refresh-btn" class="preview-refresh-btn" onclick="triggerRefresh(this)" title="Refresh (re-render content)">Reload</button>
     </div>` : '';
     
     return `<!DOCTYPE html>
@@ -456,9 +478,14 @@ export class PreviewPanel {
       transition: opacity 0.2s;
     }
     
-    .preview-refresh-btn:hover {
+    .preview-refresh-btn:hover:not(:disabled) {
       opacity: 1;
       background: var(--background-secondary);
+    }
+
+    .preview-refresh-btn:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
     }
     
     /* Content area - scrollable */
@@ -569,7 +596,7 @@ export class PreviewPanel {
     }
   </style>
 </head>
-<body>
+<body class="${themeClass}">
   ${debugPanel}
   ${titleBar}
   <div class="preview-content">
@@ -582,6 +609,13 @@ export class PreviewPanel {
     const vscode = acquireVsCodeApi();
     const isDebugMode = ${this.debugMode};
     const initialAnchor = ${JSON.stringify(anchor || "")};
+
+    function triggerRefresh(btn) {
+      if (!btn || btn.disabled) return;
+      btn.disabled = true;
+      btn.innerText = 'Reloading...';
+      vscode.postMessage({ type: 'refresh' });
+    }
 
     function scrollToAnchor(rawAnchor) {
       if (!rawAnchor) {
@@ -673,14 +707,39 @@ export class PreviewPanel {
       setTimeout(function() { scrollToAnchor(initialAnchor); }, 450);
     }
 
-    // Dynamically sync Obsidian theme class based on VS Code's theme
-    if (document.body.classList.contains('vscode-dark') || document.body.classList.contains('vscode-high-contrast')) {
-      document.body.classList.add('theme-dark');
-      document.body.classList.remove('theme-light');
-    } else {
-      document.body.classList.add('theme-light');
-      document.body.classList.remove('theme-dark');
+    function applyTheme(isDark) {
+      if (isDark) {
+        document.body.classList.add('theme-dark', 'vscode-dark');
+        document.body.classList.remove('theme-light', 'vscode-light');
+      } else {
+        document.body.classList.add('theme-light', 'vscode-light');
+        document.body.classList.remove('theme-dark', 'vscode-dark');
+      }
     }
+
+    // Initial theme sync
+    applyTheme(
+      document.body.classList.contains('vscode-dark') ||
+      document.body.classList.contains('vscode-high-contrast')
+    );
+
+    // Watch for class changes made directly by VS Code on document.body
+    var themeObserver = new MutationObserver(function(mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        if (mutations[i].attributeName === 'class') {
+          var isDark = document.body.classList.contains('vscode-dark') || 
+                       document.body.classList.contains('vscode-high-contrast');
+          if (isDark && !document.body.classList.contains('theme-dark')) {
+            document.body.classList.add('theme-dark');
+            document.body.classList.remove('theme-light');
+          } else if (!isDark && !document.body.classList.contains('theme-light')) {
+            document.body.classList.add('theme-light');
+            document.body.classList.remove('theme-dark');
+          }
+        }
+      }
+    });
+    themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class'] });
     
     // Handle Admonition/Callout collapse
     function toggleAdmonition(container) {
@@ -827,6 +886,15 @@ export class PreviewPanel {
             btn.classList.add('disabled');
           }
         }
+      } else if (msg.type === 'refreshComplete') {
+        var btn = document.getElementById('refresh-btn');
+        if (btn) {
+          btn.disabled = false;
+          btn.innerText = 'Reload';
+        }
+      // ADD THIS BRANCH:
+      } else if (msg.type === 'themeChanged') {
+        applyTheme(msg.isDark);
       }
     });
     

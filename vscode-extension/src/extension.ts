@@ -44,6 +44,53 @@ let previewPanel: PreviewPanel | undefined;
 const backStack: string[] = [];
 const forwardStack: string[] = [];
 
+// Module-level guard to prevent concurrent reload requests
+let isRefreshing = false;
+
+/**
+ * Helper to resolve the Markdown document to render.
+ * Checks the preferred path first (e.g. from PreviewPanel), then active text editor,
+ * visible editors, and active editor tabs.
+ */
+async function getActiveMarkdownDocument(preferredPath?: string): Promise<vscode.TextDocument | undefined> {
+  if (preferredPath) {
+    try {
+      return await vscode.workspace.openTextDocument(preferredPath);
+    } catch {
+      // Fall through if file on disk cannot be opened
+    }
+  }
+
+  const activeEditor = vscode.window.activeTextEditor;
+  if (activeEditor?.document.languageId === "markdown") {
+    return activeEditor.document;
+  }
+
+  const visibleMdEditor = vscode.window.visibleTextEditors.find(
+    (e) => e.document.languageId === "markdown"
+  );
+  if (visibleMdEditor) {
+    return visibleMdEditor.document;
+  }
+
+  const activeTab = vscode.window.tabGroups.activeTabGroup.activeTab;
+  const tabInput = activeTab?.input;
+  if (
+    tabInput &&
+    (tabInput instanceof vscode.TabInputText || tabInput instanceof vscode.TabInputCustom)
+  ) {
+    if (tabInput.uri.fsPath.endsWith(".md")) {
+      try {
+        return await vscode.workspace.openTextDocument(tabInput.uri);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  return undefined;
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   const config = vscode.workspace.getConfiguration("obsidianPreview");
   const port = config.get<number>("port") ?? 27123;
@@ -201,31 +248,8 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   async function openPreviewPanel(ctx: vscode.ExtensionContext, debugMode: boolean) {
-    // Capture the document to render BEFORE any async operations
-    // Try: activeTextEditor → visibleTextEditors → active tab (Custom Editor like vditor)
-    let initialDocument: vscode.TextDocument | undefined;
-    const activeEditor = vscode.window.activeTextEditor;
-    if (activeEditor?.document.languageId === "markdown") {
-      initialDocument = activeEditor.document;
-    } else {
-      const mdEditor = vscode.window.visibleTextEditors.find(e => e.document.languageId === "markdown");
-      if (mdEditor) {
-        initialDocument = mdEditor.document;
-      } else {
-        // Fallback: check active tab (handles Custom Editors like Office Viewer / vditor)
-        const activeTab = vscode.window.tabGroups.activeTabGroup.activeTab;
-        const tabInput = activeTab?.input;
-        if (tabInput && (tabInput instanceof vscode.TabInputText || tabInput instanceof vscode.TabInputCustom)) {
-          if (tabInput.uri.fsPath.endsWith('.md')) {
-            try {
-              initialDocument = await vscode.workspace.openTextDocument(tabInput.uri);
-            } catch {
-              // Ignore — file may not be accessible
-            }
-          }
-        }
-      }
-    }
+    // Capture document to render BEFORE any async operations
+    const initialDocument = await getActiveMarkdownDocument();
 
     // Create panel first so we can show error in it
     if (previewPanel) {
@@ -307,17 +331,37 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // Handle refresh button click
     previewPanel.onRefresh(async () => {
-      logger.info("Refresh requested - restarting server");
+      if (isRefreshing) {
+        logger.debug("Refresh already in progress, ignoring duplicate click");
+        return;
+      }
+
+      isRefreshing = true;
+      logger.info("Refresh requested");
+
       try {
-        await client.restart();
-        // Re-render current file
-        const editor = vscode.window.activeTextEditor;
-        if (editor && editor.document.languageId === "markdown") {
-          await updatePreview(editor.document);
+        // Only restart socket connection if we are disconnected
+        if (!client.isConnected()) {
+          logger.info("Client disconnected, reconnecting...");
+          await client.restart();
+        }
+
+        const currentPath = previewPanel?.getCurrentFilePath();
+        const docToRender = await getActiveMarkdownDocument(currentPath);
+
+        if (docToRender) {
+          await updatePreview(docToRender);
+          logger.info(`Reload complete for: ${docToRender.uri.fsPath}`);
+        } else {
+          logger.warn("Reload requested, but no markdown document found to render");
         }
       } catch (err) {
-        logger.error(`Refresh failed: ${err}`);
-        vscode.window.showErrorMessage(`Refresh failed: ${err}`);
+        logger.error(`Reload failed: ${err}`);
+        vscode.window.showErrorMessage(`Reload failed: ${err}`);
+      } finally {
+        isRefreshing = false;
+        // Signal webview to re-enable button
+        previewPanel?.postMessage({ type: "refreshComplete" });
       }
     });
 
@@ -425,6 +469,13 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   );
 
+  // Watch for VS Code theme changes and update the preview pane without reloading HTML
+  const themeChangeDisposable = vscode.window.onDidChangeActiveColorTheme((theme) => {
+    if (previewPanel) {
+      previewPanel.updateTheme(theme.kind);
+    }
+  });
+
   // Command: Open Obsidian vault
   const openObsidianCommand = vscode.commands.registerCommand(
     "obsidian-preview.openObsidian",
@@ -466,6 +517,7 @@ export function activate(context: vscode.ExtensionContext): void {
     uploadImgurCommand,
     pasteImgurCommand,
     editorChangeDisposable,
+    themeChangeDisposable,
     openObsidianCommand,
     updateVaultPathCommand,
     updatePluginCommand
@@ -500,18 +552,21 @@ async function renderDocumentContent(filePath: string, content: string): Promise
   // Send lightweight content over WebSocket
   const result = await client.render(filePath, sanitizedContent);
 
+  // FIX: Guard against undefined or malformed response
+  if (!result || typeof result.html !== "string") {
+    throw new Error("Invalid or empty response from render server");
+  }
+
   // Restore original base64 image strings into the rendered HTML
   let finalHtml = result.html;
   dataUriMap.forEach((dataUri, key) => {
-    const found = finalHtml.includes(key);
-    if (found) {
+    if (finalHtml.includes(key)) {
       const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       finalHtml = finalHtml.replace(new RegExp(escapedKey, 'g'), () => dataUri);
-      const stillHasKey = finalHtml.includes(key);
     }
   });
 
-  return { html: finalHtml, css: result.css };
+  return { html: finalHtml, css: result.css || "" };
 }
 
 async function updatePreview(document: vscode.TextDocument, targetAnchor?: string): Promise<void> {
