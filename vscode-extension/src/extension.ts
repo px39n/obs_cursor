@@ -12,6 +12,7 @@ import { WikilinkLinkProvider } from "./linkProvider";
 import { WikilinkCompletionProvider } from "./completionProvider";
 import { ImgurUploadHandler } from "./imgur";
 import { logger, Logger } from "./logger";
+import { findAnchorInLines, findWikilinkFile, mdBaseName } from "./wikilink";
 
 /**
  * Protocol version — increment this when there's a breaking change in the
@@ -40,7 +41,55 @@ let hoverProviderDisposable: vscode.Disposable | undefined;
 let linkProviderDisposable: vscode.Disposable | undefined;
 let completionProviderDisposable: vscode.Disposable | undefined;
 let previewPanel: PreviewPanel | undefined;
-const navigationStack: string[] = [];
+const backStack: string[] = [];
+const forwardStack: string[] = [];
+
+// Module-level guard to prevent concurrent reload requests
+let isRefreshing = false;
+
+/**
+ * Helper to resolve the Markdown document to render.
+ * Checks the preferred path first (e.g. from PreviewPanel), then active text editor,
+ * visible editors, and active editor tabs.
+ */
+async function getActiveMarkdownDocument(preferredPath?: string): Promise<vscode.TextDocument | undefined> {
+  if (preferredPath) {
+    try {
+      return await vscode.workspace.openTextDocument(preferredPath);
+    } catch {
+      // Fall through if file on disk cannot be opened
+    }
+  }
+
+  const activeEditor = vscode.window.activeTextEditor;
+  if (activeEditor?.document.languageId === "markdown") {
+    return activeEditor.document;
+  }
+
+  const visibleMdEditor = vscode.window.visibleTextEditors.find(
+    (e) => e.document.languageId === "markdown"
+  );
+  if (visibleMdEditor) {
+    return visibleMdEditor.document;
+  }
+
+  const activeTab = vscode.window.tabGroups.activeTabGroup.activeTab;
+  const tabInput = activeTab?.input;
+  if (
+    tabInput &&
+    (tabInput instanceof vscode.TabInputText || tabInput instanceof vscode.TabInputCustom)
+  ) {
+    if (tabInput.uri.fsPath.endsWith(".md")) {
+      try {
+        return await vscode.workspace.openTextDocument(tabInput.uri);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  return undefined;
+}
 
 export function activate(context: vscode.ExtensionContext): void {
   const config = vscode.workspace.getConfiguration("obsidianPreview");
@@ -50,6 +99,7 @@ export function activate(context: vscode.ExtensionContext): void {
   watcher = new EditorWatcher();
   decorator = new EditorDecorator();
   hoverProvider = new WikilinkHoverProvider();
+  hoverProvider.enable(); // FIX: Enable immediately on extension activation
   linkProvider = new WikilinkLinkProvider();
   completionProvider = new WikilinkCompletionProvider();
   imgurHandler = new ImgurUploadHandler(client);
@@ -79,7 +129,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Handle render updates (pushed from server)
   client.onRenderUpdate((response) => {
     if (previewPanel && response.filePath) {
-      const fileName = response.filePath.split(/[/\\]/).pop()?.replace(/\.md$/i, '') || '';
+      const fileName = mdBaseName(response.filePath);
       previewPanel.updateContent(response.html, response.css, fileName);
       logger.debug(`Render update applied for: ${fileName}`);
     }
@@ -198,42 +248,23 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   async function openPreviewPanel(ctx: vscode.ExtensionContext, debugMode: boolean) {
-    // Capture the document to render BEFORE any async operations
-    // Try: activeTextEditor → visibleTextEditors → active tab (Custom Editor like vditor)
-    let initialDocument: vscode.TextDocument | undefined;
-    const activeEditor = vscode.window.activeTextEditor;
-    if (activeEditor?.document.languageId === "markdown") {
-      initialDocument = activeEditor.document;
-    } else {
-      const mdEditor = vscode.window.visibleTextEditors.find(e => e.document.languageId === "markdown");
-      if (mdEditor) {
-        initialDocument = mdEditor.document;
-      } else {
-        // Fallback: check active tab (handles Custom Editors like Office Viewer / vditor)
-        const activeTab = vscode.window.tabGroups.activeTabGroup.activeTab;
-        const tabInput = activeTab?.input;
-        if (tabInput && (tabInput instanceof vscode.TabInputText || tabInput instanceof vscode.TabInputCustom)) {
-          if (tabInput.uri.fsPath.endsWith('.md')) {
-            try {
-              initialDocument = await vscode.workspace.openTextDocument(tabInput.uri);
-            } catch {
-              // Ignore — file may not be accessible
-            }
-          }
-        }
-      }
-    }
+    // Capture document to render BEFORE any async operations
+    const initialDocument = await getActiveMarkdownDocument();
 
     // Create panel first so we can show error in it
     if (previewPanel) {
       previewPanel.dispose();
     }
-    navigationStack.length = 0; // Reset history for new panel
-    previewPanel = PreviewPanel.create(ctx.extensionUri, debugMode);
+    backStack.length = 0;
+    forwardStack.length = 0;
+    const panel = PreviewPanel.create(ctx.extensionUri, debugMode);
+    previewPanel = panel;
     
     // Handle panel dispose
-    previewPanel.onDispose(() => {
-      previewPanel = undefined;
+    panel.onDispose(() => {
+      if (previewPanel === panel) {
+        previewPanel = undefined;
+      }
     });
 
     // Handle link clicks
@@ -248,16 +279,45 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // Handle back button click
     previewPanel.onNavigateBack(async () => {
-      if (navigationStack.length === 0) return;
-      const prevPath = navigationStack.pop()!;
-      previewPanel?.setCanGoBack(navigationStack.length > 0);
-      
+      if (backStack.length === 0) return;
+
+      const currentPath = previewPanel?.getCurrentFilePath();
+      if (currentPath) {
+        forwardStack.push(currentPath);
+      }
+
+      const prevPath = backStack.pop()!;
+      previewPanel?.setCanGoBack(backStack.length > 0);
+      previewPanel?.setCanGoForward(forwardStack.length > 0);
+
       try {
         const doc = await vscode.workspace.openTextDocument(prevPath);
         await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
         // Preview will update via onDidChangeActiveTextEditor
       } catch (err) {
         console.error("[Preview] Navigate back failed:", err);
+      }
+    });
+
+    // Handle forward button click
+    previewPanel.onNavigateForward(async () => {
+      if (forwardStack.length === 0) return;
+
+      const currentPath = previewPanel?.getCurrentFilePath();
+      if (currentPath) {
+        backStack.push(currentPath);
+      }
+
+      const nextPath = forwardStack.pop()!;
+      previewPanel?.setCanGoBack(backStack.length > 0);
+      previewPanel?.setCanGoForward(forwardStack.length > 0);
+
+      try {
+        const doc = await vscode.workspace.openTextDocument(nextPath);
+        await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+        // Preview will update via onDidChangeActiveTextEditor
+      } catch (err) {
+        console.error("[Preview] Navigate forward failed:", err);
       }
     });
 
@@ -271,17 +331,37 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // Handle refresh button click
     previewPanel.onRefresh(async () => {
-      logger.info("Refresh requested - restarting server");
+      if (isRefreshing) {
+        logger.debug("Refresh already in progress, ignoring duplicate click");
+        return;
+      }
+
+      isRefreshing = true;
+      logger.info("Refresh requested");
+
       try {
-        await client.restart();
-        // Re-render current file
-        const editor = vscode.window.activeTextEditor;
-        if (editor && editor.document.languageId === "markdown") {
-          await updatePreview(editor.document);
+        // Only restart socket connection if we are disconnected
+        if (!client.isConnected()) {
+          logger.info("Client disconnected, reconnecting...");
+          await client.restart();
+        }
+
+        const currentPath = previewPanel?.getCurrentFilePath();
+        const docToRender = await getActiveMarkdownDocument(currentPath);
+
+        if (docToRender) {
+          await updatePreview(docToRender);
+          logger.info(`Reload complete for: ${docToRender.uri.fsPath}`);
+        } else {
+          logger.warn("Reload requested, but no markdown document found to render");
         }
       } catch (err) {
-        logger.error(`Refresh failed: ${err}`);
-        vscode.window.showErrorMessage(`Refresh failed: ${err}`);
+        logger.error(`Reload failed: ${err}`);
+        vscode.window.showErrorMessage(`Reload failed: ${err}`);
+      } finally {
+        isRefreshing = false;
+        // Signal webview to re-enable button
+        previewPanel?.postMessage({ type: "refreshComplete" });
       }
     });
 
@@ -342,7 +422,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const fileName = filePath.split(/[/\\]/).pop() || '';
       logger.debug(`Render request for: ${fileName}`);
       try {
-        const result = await client.render(filePath, content);
+        const result = await renderDocumentContent(filePath, content);
         // Extract filename without extension for title
         const titleName = fileName.replace(/\.md$/i, '');
         previewPanel.updateContent(result.html, result.css, titleName);
@@ -376,13 +456,25 @@ export function activate(context: vscode.ExtensionContext): void {
         editor &&
         editor.document.languageId === "markdown"
       ) {
-        // Show loading immediately when switching files
-        const fileName = editor.document.uri.fsPath.split(/[/\\]/).pop()?.replace(/\.md$/i, '') || '';
+        const currentPath = editor.document.uri.fsPath;
+        
+        if (currentPath === previewPanel.getCurrentFilePath()) {
+          return;
+        }
+
+        const fileName = mdBaseName(currentPath);
         previewPanel.showLoading(fileName);
         await updatePreview(editor.document);
       }
     }
   );
+
+  // Watch for VS Code theme changes and update the preview pane without reloading HTML
+  const themeChangeDisposable = vscode.window.onDidChangeActiveColorTheme((theme) => {
+    if (previewPanel) {
+      previewPanel.updateTheme(theme.kind);
+    }
+  });
 
   // Command: Open Obsidian vault
   const openObsidianCommand = vscode.commands.registerCommand(
@@ -425,6 +517,7 @@ export function activate(context: vscode.ExtensionContext): void {
     uploadImgurCommand,
     pasteImgurCommand,
     editorChangeDisposable,
+    themeChangeDisposable,
     openObsidianCommand,
     updateVaultPathCommand,
     updatePluginCommand
@@ -436,17 +529,61 @@ export function activate(context: vscode.ExtensionContext): void {
   logger.info("Extension activated");
 }
 
-async function updatePreview(document: vscode.TextDocument): Promise<void> {
-  if (!previewPanel || !client.isConnected()) return;
+async function renderDocumentContent(filePath: string, content: string): Promise<{ html: string; css: string }> {
+  // Pre-convert markdown `![alt](data:image/...)` to HTML `<img src="..." alt="...">`
+  const contentWithHtmlImages = content.replace(
+    /!\[([^\]]*)\]\((data:image\/[a-zA-Z0-9+-]+;base64,[a-zA-Z0-9+/=]+)\)/g,
+    (match, alt, dataUri) => `<img src="${dataUri}" alt="${alt}" />`
+  );
+
+  // Swap base64 data URIs with short placeholders before sending over WebSocket
+  const dataUriMap = new Map<string, string>();
+  let placeholderCount = 0;
+
+  const sanitizedContent = contentWithHtmlImages.replace(
+    /data:image\/[a-zA-Z0-9+-]+;base64,[a-zA-Z0-9+/=]+/g,
+    (dataUri) => {
+      const key = `__DATA_URI_PLACEHOLDER_${placeholderCount++}__`;
+      dataUriMap.set(key, dataUri);
+      return key;
+    }
+  );
+
+  // Send lightweight content over WebSocket
+  const result = await client.render(filePath, sanitizedContent);
+
+  // FIX: Guard against undefined or malformed response
+  if (!result || typeof result.html !== "string") {
+    throw new Error("Invalid or empty response from render server");
+  }
+
+  // Restore original base64 image strings into the rendered HTML
+  let finalHtml = result.html;
+  dataUriMap.forEach((dataUri, key) => {
+    if (finalHtml.includes(key)) {
+      const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      finalHtml = finalHtml.replace(new RegExp(escapedKey, 'g'), () => dataUri);
+    }
+  });
+
+  return { html: finalHtml, css: result.css || "" };
+}
+
+async function updatePreview(document: vscode.TextDocument, targetAnchor?: string): Promise<void> {
+  if (!previewPanel || !client.isConnected()) {
+    return;
+  }
 
   const filePath = document.uri.fsPath;
+  previewPanel.setCurrentFilePath(filePath);
   const content = document.getText();
   // Extract filename without extension for title
-  const fileName = filePath.split(/[/\\]/).pop()?.replace(/\.md$/i, '') || '';
-  
+  const fileName = mdBaseName(filePath);
+  const anchor = targetAnchor ?? previewPanel.consumePendingAnchor();
+
   try {
-    const result = await client.render(filePath, content);
-    previewPanel.updateContent(result.html, result.css, fileName);
+    const result = await renderDocumentContent(filePath, content);
+    previewPanel.updateContent(result.html, result.css, fileName, anchor);
   } catch (err) {
     console.error("[Preview] Render failed:", err);
     const obsProto = client.getObsidianProtocolVersion();
@@ -466,51 +603,81 @@ async function updatePreview(document: vscode.TextDocument): Promise<void> {
 
 async function getHoverPreview(targetPath: string): Promise<{ html: string; css: string } | null> {
   if (!client.isConnected()) return null;
-  
-  // Skip same-file anchors (e.g., "#Heading")
-  if (targetPath.startsWith("#")) {
-    return null;
-  }
-  
+
   try {
-    // Parse the link - handle [[File#Heading]] format
-    let filePart = targetPath;
-    const hashIndex = targetPath.indexOf("#");
+    // 1. Safe URL decoding
+    let decodedTarget = targetPath;
+    try {
+      decodedTarget = decodeURIComponent(targetPath).trim();
+    } catch {
+      decodedTarget = targetPath.trim();
+    }
+
+    // 2. Parse file part and anchor part
+    let filePart = decodedTarget;
+    let anchorPart = "";
+    const hashIndex = decodedTarget.indexOf("#");
     if (hashIndex !== -1) {
-      filePart = targetPath.substring(0, hashIndex);
+      filePart = decodedTarget.substring(0, hashIndex).trim();
+      anchorPart = decodedTarget.substring(hashIndex + 1).trim();
     }
-    
-    // Add .md extension if not present
-    let searchPath = filePart;
-    if (!searchPath.endsWith(".md")) {
-      searchPath = searchPath + ".md";
+
+    const currentFilePath = previewPanel?.getCurrentFilePath() || vscode.window.activeTextEditor?.document.uri.fsPath;
+
+    // 3. Resolve target file path (handles same-file anchors like #Heading)
+    let targetFilePath: string | undefined;
+    if (!filePart && currentFilePath) {
+      targetFilePath = currentFilePath;
+    } else if (filePart) {
+      const targetUri = await findWikilinkFile(filePart);
+      if (targetUri) {
+        targetFilePath = targetUri.fsPath;
+      }
     }
-    
-    // Find the file
-    let files = await vscode.workspace.findFiles(`**/${searchPath}`);
-    if (files.length === 0) {
-      const filename = searchPath.split("/").pop() || searchPath;
-      files = await vscode.workspace.findFiles(`**/${filename}`);
+
+    if (!targetFilePath) {
+      return {
+        html: `<p style="color:#888;font-style:italic;">File not found: ${decodedTarget}</p>`,
+        css: "",
+      };
     }
-    
-    if (files.length === 0) {
-      return { html: `<p><em>File not found: ${targetPath}</em></p>`, css: "" };
+
+    // 4. Read file content and locate anchor line
+    const content = fs.readFileSync(targetFilePath, "utf8");
+    const lines = content.split("\n");
+
+    let startLine = 0;
+    if (anchorPart) {
+      const matchedLine = findAnchorInLines(lines, anchorPart);
+      if (matchedLine !== null) {
+        startLine = matchedLine;
+      }
     }
-    
-    // Read file content
-    const doc = await vscode.workspace.openTextDocument(files[0]);
-    const content = doc.getText();
-    
-    // Get first 50 lines for preview
-    const lines = content.split("\n").slice(0, 50);
-    const previewContent = lines.join("\n");
-    
-    // Render through Obsidian
-    const result = await client.render(files[0].fsPath, previewContent);
-    return result;
+
+    // Slice 40 lines starting from anchor position for preview
+    const endLine = Math.min(lines.length, startLine + 40);
+    let slicedContent = lines.slice(startLine, endLine).join("\n");
+
+    if (startLine > 0) {
+      slicedContent = `*... (above omitted)*\n\n` + slicedContent;
+    }
+
+    // 5. Render through Obsidian
+    const result = await client.render(targetFilePath, slicedContent);
+
+    // 6. Process image paths so local images render inside webview popup
+    let finalHtml = result.html;
+    if (previewPanel) {
+      finalHtml = previewPanel.processLocalImages(finalHtml, targetFilePath);
+    }
+
+    return { html: finalHtml, css: result.css };
   } catch (err) {
-    console.error("[Preview] Hover preview failed:", err);
-    return null;
+    logger.error(`[Preview] Hover preview error: ${err}`);
+    return {
+      html: `<p style="color:#d32f2f;font-style:italic;">Error generating preview: ${err}</p>`,
+      css: "",
+    };
   }
 }
 
@@ -520,49 +687,96 @@ async function getHoverPreview(targetPath: string): Promise<{ html: string; css:
  * @param sourcePath The path of the source file containing the link
  */
 async function navigateToWikilink(targetPath: string, sourcePath?: string): Promise<void> {
-  if (!targetPath) return;
+  if (!targetPath) {
+    return;
+  }
 
   console.log("[Navigate] target:", targetPath, "source:", sourcePath);
+
+  targetPath = decodeURIComponent(targetPath).trim();
+
+  const pipeIndex = targetPath.indexOf("|");
+  if (pipeIndex !== -1) {
+    targetPath = targetPath.substring(0, pipeIndex);
+  }
 
   // Parse the link - handle [[File#Heading]] format
   let filePart = targetPath;
   let anchorPart = "";
-  
   const hashIndex = targetPath.indexOf("#");
   if (hashIndex !== -1) {
-    filePart = targetPath.substring(0, hashIndex);
-    anchorPart = targetPath.substring(hashIndex + 1);
+    filePart = targetPath.substring(0, hashIndex).trim();
+    anchorPart = targetPath.substring(hashIndex + 1).trim();
   }
-  
-  // If only anchor (e.g., "#Code"), it's a link within the same file
-  if (!filePart && anchorPart) {
-    await navigateToAnchor(anchorPart);
+
+  const currentDocPath = sourcePath || previewPanel?.getCurrentFilePath() || vscode.window.activeTextEditor?.document.uri.fsPath;
+
+  // Handle same-file navigation (either starting with '#' or matching current file path)
+  let isCurrentFile = !filePart;
+  if (!isCurrentFile && currentDocPath) {
+    const currentBase = path.basename(currentDocPath, ".md").toLowerCase();
+    const targetBase = path.basename(filePart, ".md").toLowerCase();
+    if (currentBase === targetBase) {
+      isCurrentFile = true;
+    }
+  }
+
+  if (isCurrentFile) {
+    let editor = vscode.window.activeTextEditor;
+    if (!editor || (currentDocPath && editor.document.uri.fsPath.toLowerCase() !== currentDocPath.toLowerCase())) {
+      editor = vscode.window.visibleTextEditors.find(
+        (e) => currentDocPath && e.document.uri.fsPath.toLowerCase() === currentDocPath.toLowerCase()
+      ) || vscode.window.visibleTextEditors.find((e) => e.document.languageId === "markdown");
+    }
+
+    if (anchorPart) {
+      if (editor) {
+        editor = await vscode.window.showTextDocument(editor.document, {
+          viewColumn: editor.viewColumn ?? vscode.ViewColumn.One,
+          preserveFocus: false,
+        });
+        await navigateToAnchorInEditor(editor, anchorPart);
+      } else if (currentDocPath) {
+        const doc = await vscode.workspace.openTextDocument(currentDocPath);
+        const ed = await vscode.window.showTextDocument(doc, {
+          viewColumn: vscode.ViewColumn.One,
+          preserveFocus: false,
+        });
+        await navigateToAnchorInEditor(ed, anchorPart);
+      }
+
+      if (previewPanel) {
+        previewPanel.scrollToAnchor(anchorPart);
+      }
+    }
     return;
   }
-  
-  // Add .md extension if not present
-  let searchPath = filePart;
-  if (!searchPath.endsWith(".md")) {
-    searchPath = searchPath + ".md";
-  }
 
-  // Try to find the file
-  let files = await vscode.workspace.findFiles(`**/${searchPath}`);
-  
-  // If not found, try without path (just filename)
-  if (files.length === 0) {
-    const filename = searchPath.split("/").pop() || searchPath;
-    files = await vscode.workspace.findFiles(`**/${filename}`);
-  }
+  // Resolve file using helper function (handles missing .md extension)
+  const searchPath = filePart.endsWith(".md") ? filePart : filePart + ".md";
 
-  if (files.length > 0) {
+  // Find the file
+  const targetUri = await findWikilinkFile(filePart);
+
+  if (targetUri) {
+    if (previewPanel && anchorPart) {
+      previewPanel.setPendingAnchor(anchorPart);
+    }
+
     // File found - open it
-    const doc = await vscode.workspace.openTextDocument(files[0]);
-    const editor = await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
-    
+    const doc = await vscode.workspace.openTextDocument(targetUri);
+    const editor = await vscode.window.showTextDocument(doc, {
+      viewColumn: vscode.ViewColumn.One,
+      preserveFocus: false,
+    });
+
     // If there's an anchor, navigate to it
     if (anchorPart) {
       await navigateToAnchorInEditor(editor, anchorPart);
+    }
+
+    if (previewPanel && previewPanel.getCurrentFilePath()?.toLowerCase() === targetUri.fsPath.toLowerCase() && anchorPart) {
+      previewPanel.scrollToAnchor(anchorPart);
     }
   } else {
     // File not found - ask to create
@@ -570,37 +784,36 @@ async function navigateToWikilink(targetPath: string, sourcePath?: string): Prom
   }
 }
 
-/**
- * Navigate to an anchor in the current editor.
- */
-async function navigateToAnchor(anchor: string): Promise<void> {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) return;
-  
-  await navigateToAnchorInEditor(editor, anchor);
+function findAnchorLine(document: vscode.TextDocument, rawAnchor: string): number | null {
+  const text = document.getText();
+  const lines = text.split("\n");
+  const line = findAnchorInLines(lines, rawAnchor);
+  return line;
 }
 
 /**
  * Navigate to an anchor (heading) in the given editor.
  */
 async function navigateToAnchorInEditor(editor: vscode.TextEditor, anchor: string): Promise<void> {
-  const doc = editor.document;
-  const text = doc.getText();
-  const lines = text.split("\n");
-  
-  const anchorLower = anchor.toLowerCase().replace(/-/g, " ");
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const headingMatch = line.match(/^#+\s+(.+)$/);
-    if (headingMatch) {
-      const headingText = headingMatch[1].toLowerCase().trim();
-      if (headingText === anchorLower || headingText.replace(/\s+/g, "-") === anchor.toLowerCase()) {
-        const position = new vscode.Position(i, 0);
-        editor.selection = new vscode.Selection(position, position);
-        editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.AtTop);
-        break;
-      }
-    }
+  const line = findAnchorLine(editor.document, anchor);
+
+  if (line !== null) {
+    const position = new vscode.Position(line, 0);
+    const range = new vscode.Range(position, position);
+
+    const applyReveal = () => {
+      editor.selection = new vscode.Selection(position, position);
+      editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+      void vscode.commands.executeCommand("revealLine", {
+        lineNumber: line,
+        at: "center",
+      });
+    };
+
+    applyReveal();
+    setTimeout(applyReveal, 100);
+    setTimeout(applyReveal, 250);
+    setTimeout(applyReveal, 500);
   }
 }
 
@@ -646,15 +859,19 @@ async function promptCreateFile(fileName: string, sourcePath?: string): Promise<
 }
 
 async function handleLinkClick(targetPath: string): Promise<void> {
-  // Push current file to navigation stack before navigating
-  const currentEditor = vscode.window.activeTextEditor;
-  if (currentEditor && currentEditor.document.languageId === "markdown") {
-    navigationStack.push(currentEditor.document.uri.fsPath);
+  const sourcePath = previewPanel?.getCurrentFilePath()
+    || vscode.window.activeTextEditor?.document.uri.fsPath
+    || vscode.window.visibleTextEditors.find(e => e.document.languageId === "markdown")?.document.uri.fsPath;
+
+  if (sourcePath) {
+    backStack.push(sourcePath);
+    forwardStack.length = 0; // Clear forward history when following a new link
     previewPanel?.setCanGoBack(true);
+    previewPanel?.setCanGoForward(false);
   }
   
   // Use shared navigation logic
-  await navigateToWikilink(targetPath, currentEditor?.document.uri.fsPath);
+  await navigateToWikilink(targetPath, sourcePath);
 }
 
 // ─── Auto-Launch Obsidian ───

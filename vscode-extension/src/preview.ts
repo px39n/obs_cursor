@@ -1,22 +1,58 @@
 import * as vscode from "vscode";
+import * as path from "path";
 
 type LinkClickCallback = (targetPath: string) => void;
 type HoverPreviewCallback = (targetPath: string) => Promise<{ html: string; css: string } | null>;
 type RefreshCallback = () => void;
 type NavigateBackCallback = () => void;
+type NavigateForwardCallback = () => void;
 type FocusObsidianCallback = () => void;
 
 export class PreviewPanel {
   private static readonly viewType = "obsidianPreview";
   private readonly panel: vscode.WebviewPanel;
+  private currentFilePath: string | undefined;
   private linkClickCallbacks: LinkClickCallback[] = [];
   private hoverPreviewCallback: HoverPreviewCallback | null = null;
   private refreshCallbacks: RefreshCallback[] = [];
   private navigateBackCallbacks: NavigateBackCallback[] = [];
+  private navigateForwardCallbacks: NavigateForwardCallback[] = [];
   private focusObsidianCallbacks: FocusObsidianCallback[] = [];
   private disposeCallbacks: (() => void)[] = [];
   private debugMode: boolean = false;
   private canGoBack: boolean = false;
+  private canGoForward: boolean = false;
+  private pendingAnchor: string | undefined;
+  private currentAnchor: string | undefined;
+
+  setPendingAnchor(anchor: string | undefined): void {
+    this.pendingAnchor = anchor;
+  }
+
+  consumePendingAnchor(): string | undefined {
+    const anchor = this.pendingAnchor;
+    this.pendingAnchor = undefined;
+    return anchor;
+  }
+
+  scrollToAnchor(anchor: string): void {
+    this.panel.webview.postMessage({ type: "scrollToAnchor", anchor });
+  }
+
+  // ADD THIS METHOD:
+  updateTheme(themeKind: vscode.ColorThemeKind): void {
+    const isDark =
+      themeKind === vscode.ColorThemeKind.Dark ||
+      themeKind === vscode.ColorThemeKind.HighContrast;
+    this.panel.webview.postMessage({
+      type: "themeChanged",
+      isDark: isDark,
+    });
+  }
+
+  postMessage(message: any): void {
+    this.panel.webview.postMessage(message);
+  }
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -48,6 +84,10 @@ export class PreviewPanel {
         this.refreshCallbacks.forEach((cb) => cb());
       } else if (message.type === "navigateBack") {
         this.navigateBackCallbacks.forEach((cb) => cb());
+      } else if (message.type === "navigateForward") {
+        this.navigateForwardCallbacks.forEach((cb) => cb());
+      } else if (message.type === "openExternal") {
+        vscode.env.openExternal(vscode.Uri.parse(message.url));
       } else if (message.type === "focusObsidian") {
         this.focusObsidianCallbacks.forEach((cb) => cb());
       }
@@ -63,7 +103,7 @@ export class PreviewPanel {
   private currentTitle: string | undefined;
 
   static create(extensionUri: vscode.Uri, debugMode: boolean = false): PreviewPanel {
-    // Get all workspace folders and active editor's folder
+// Get all workspace folders and active editor's folder
     const workspaceFolders = vscode.workspace.workspaceFolders;
     const activeEditor = vscode.window.activeTextEditor;
     
@@ -75,11 +115,11 @@ export class PreviewPanel {
       workspaceFolders.forEach(folder => resourceRoots.push(folder.uri));
     }
     
-    // Add active file's directory (vault might be here)
+// Add active file's directory (vault might be here)
     if (activeEditor) {
       const fileDir = vscode.Uri.joinPath(activeEditor.document.uri, '..');
       resourceRoots.push(fileDir);
-      // Also add parent directories up to drive root (to cover vault root)
+// Also add parent directories up to drive root (to cover vault root)
       let parent = fileDir;
       for (let i = 0; i < 10; i++) {
         const newParent = vscode.Uri.joinPath(parent, '..');
@@ -107,6 +147,14 @@ export class PreviewPanel {
     return previewPanel;
   }
 
+  setCurrentFilePath(filePath: string | undefined): void {
+    this.currentFilePath = filePath;
+  }
+
+  getCurrentFilePath(): string | undefined {
+    return this.currentFilePath;
+  }
+
   showLoading(title?: string): void {
     this.currentTitle = title;
     const loadingHtml = `
@@ -118,8 +166,9 @@ export class PreviewPanel {
     this.panel.webview.html = this.getWebviewContent(loadingHtml, "");
   }
 
-  updateContent(html: string, css: string, title?: string): void {
+  updateContent(html: string, css: string, title?: string, anchor?: string): void {
     this.currentTitle = title;
+    this.currentAnchor = anchor;
     // Debug: log HTML size
     if (this.debugMode) {
       console.log(`[Preview] Received HTML: ${html.length} chars`);
@@ -132,64 +181,131 @@ export class PreviewPanel {
     }
     
     // Convert local image paths to webview URIs
-    const processedHtml = this.processLocalImages(html);
-    this.panel.webview.html = this.getWebviewContent(processedHtml, css);
+    const processedHtml = this.processLocalImages(html, this.currentFilePath);
+    this.panel.webview.html = this.getWebviewContent(processedHtml, css, anchor);
+
+    if (anchor) {
+      setTimeout(() => this.scrollToAnchor(anchor), 150);
+      setTimeout(() => this.scrollToAnchor(anchor), 500);
+    }
   }
   
   /**
    * Convert local image paths to webview-compatible URIs
    */
-  private processLocalImages(html: string): string {
-    if (!this.vaultUri) {
-      console.log("[Preview] No vaultUri, skipping image processing");
-      return html;
-    }
-    
+  public processLocalImages(html: string, noteFilePath?: string): string {
+    if (!this.vaultUri) return html;
+
     const webview = this.panel.webview;
     const vaultPath = this.vaultUri.fsPath;
-    
-    console.log("[Preview] Processing images, vaultPath:", vaultPath);
-    
-    // Match src attributes with various patterns
-    return html.replace(
-      /src=["']([^"']+)["']/g,
-      (match, src) => {
-        console.log("[Preview] Found src:", src);
-        
-        // Skip data URIs and external URLs
-        if (src.startsWith('data:') || src.startsWith('http://') || src.startsWith('https://')) {
-          return match;
+    const noteDir = noteFilePath ? path.dirname(noteFilePath) : vaultPath;
+
+    const isImage = (url: string) => {
+      const lower = url.toLowerCase().split('?')[0].split('#')[0];
+      return lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') ||
+             lower.endsWith('.gif') || lower.endsWith('.webp') || lower.endsWith('.svg') ||
+             lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('data:');
+    };
+
+    const parseSizeStyle = (altText: string, existingWidth?: string, existingHeight?: string): string => {
+      let width = existingWidth;
+      let height = existingHeight;
+
+      if (altText) {
+        const parts = altText.split('|');
+        const lastPart = parts[parts.length - 1].trim();
+        const match = lastPart.match(/^(\d+)(?:x(\d+))?$/);
+        if (match) {
+          width = match[1];
+          if (match[2]) height = match[2];
         }
+      }
+
+      let style = "";
+      if (width) style += `width:${width}px !important;`;
+      if (height) style += `height:${height}px !important;`;
+      if (!height && width) style += `height:auto;`;
+      return style;
+    };
+    
+    // Safely append 'internal-embed-image'
+    const addClass = (attrs: string, className: string): string => {
+      const classMatch = attrs.match(/class=["']([^"']*)["']/i);
+      if (classMatch) {
+        const currentClasses = classMatch[1].split(/\s+/).filter(Boolean);
+        if (!currentClasses.includes(className)) {
+          currentClasses.push(className);
+        }
+        return attrs.replace(/class=["'][^"']*["']/i, `class="${currentClasses.join(' ')}"`);
+      } else {
+        return `class="${className}" ${attrs}`;
+      }
+    };
+
+    let transformedHtml = html.replace(
+      /<span\s+[^>]*class=["'][^"']*internal-embed[^"']*["'][^>]*>/gi,
+      (spanTag) => {
+        const srcMatch = spanTag.match(/src=["']([^"']+)["']/i);
+        const altMatch = spanTag.match(/alt=["']([^"']+)["']/i) || spanTag.match(/width=["']([^"']+)["']/i);
+        const src = srcMatch ? srcMatch[1] : "";
+        const alt = altMatch ? altMatch[1] : "";
+
+        if (src && isImage(src)) {
+          const sizeStyle = parseSizeStyle(alt);
+          return `<img class="internal-embed-image" style="max-width:100%;${sizeStyle}" alt="${alt}" src="${src}" `;
+        }
+        return spanTag;
+      }
+    );
+
+    return transformedHtml.replace(
+      /<img\s+([^>]*src=["']([^"']+)["'][^>]*)>/gi,
+      (imgTag, fullAttrs, src) => {
+        const altMatch = fullAttrs.match(/alt=["']([^"']+)["']/i);
+        const widthMatch = fullAttrs.match(/width=["']([^"']+)["']/i);
+        const heightMatch = fullAttrs.match(/height=["']([^"']+)["']/i);
+
+        const alt = altMatch ? altMatch[1] : "";
+        const w = widthMatch ? widthMatch[1] : undefined;
+        const h = heightMatch ? heightMatch[1] : undefined;
+
+        const sizeStyle = parseSizeStyle(alt, w, h);
         
-        // Handle app:// protocol (Obsidian internal)
-        if (src.startsWith('app://')) {
-          // Extract the path after app://xxx/
-          const pathMatch = src.match(/app:\/\/[^/]+\/(.+)/);
+        // Clean up
+        let cleanSrc = src.replace(/^file:\/\/\/?/i, '');
+        cleanSrc = cleanSrc.replace(/\\/g, '/');
+
+        let newSrc = src;
+
+        if (cleanSrc.startsWith('data:') || cleanSrc.startsWith('http://') || cleanSrc.startsWith('https://')) {
+          newSrc = cleanSrc;
+        } else if (cleanSrc.startsWith('app://')) {
+                    const pathMatch = cleanSrc.match(/app:\/\/[^/]+\/(.+)/);
           if (pathMatch) {
             let filePath = decodeURIComponent(pathMatch[1]);
-            // Remove query string (e.g., ?1738439523304)
-            const queryIndex = filePath.indexOf('?');
-            if (queryIndex !== -1) {
-              filePath = filePath.substring(0, queryIndex);
+                        const queryIndex = filePath.indexOf('?');
+            if (queryIndex !== -1) filePath = filePath.substring(0, queryIndex);
+            filePath = filePath.replace(/^file:\/\/\/?/i, '');
+            newSrc = webview.asWebviewUri(vscode.Uri.file(filePath)).toString();
+          }
+        } else {
+          try {
+            let absolutePath: string;
+            if (path.isAbsolute(cleanSrc) || /^[a-zA-Z]:\//.test(cleanSrc)) {
+              absolutePath = path.normalize(cleanSrc);
+            } else {
+              absolutePath = path.resolve(noteDir, cleanSrc);
             }
-            console.log("[Preview] app:// path converted to:", filePath);
-            const fileUri = vscode.Uri.file(filePath);
-            const webviewUri = webview.asWebviewUri(fileUri);
-            return `src="${webviewUri}"`;
+            newSrc = webview.asWebviewUri(vscode.Uri.file(absolutePath)).toString();
+          } catch {
+            newSrc = src;
           }
         }
-        
-        // Handle relative paths
-        try {
-          const absolutePath = src.startsWith('/') ? src : `${vaultPath}/${src}`;
-          console.log("[Preview] Relative path converted to:", absolutePath);
-          const fileUri = vscode.Uri.file(absolutePath);
-          const webviewUri = webview.asWebviewUri(fileUri);
-          return `src="${webviewUri}"`;
-        } catch (err) {
-          console.log("[Preview] Error processing image:", err);
-          return match;
-        }
+
+        const attrsWithClass = addClass(fullAttrs, 'internal-embed-image');
+        const attrsWithNewSrc = attrsWithClass.replace(/src=["'][^"']+["']/i, `src="${newSrc}"`);
+
+        return `<img ${attrsWithNewSrc} style="max-width:100%;${sizeStyle}" />`;
       }
     );
   }
@@ -210,6 +326,10 @@ export class PreviewPanel {
     this.navigateBackCallbacks.push(callback);
   }
 
+  onNavigateForward(callback: NavigateForwardCallback): void {
+    this.navigateForwardCallbacks.push(callback);
+  }
+
   onFocusObsidian(callback: FocusObsidianCallback): void {
     this.focusObsidianCallbacks.push(callback);
   }
@@ -220,6 +340,11 @@ export class PreviewPanel {
     this.panel.webview.postMessage({ type: "updateBackButton", visible: value });
   }
 
+  setCanGoForward(value: boolean): void {
+    this.canGoForward = value;
+    this.panel.webview.postMessage({ type: "updateForwardButton", visible: value });
+  }
+
   onDispose(callback: () => void): void {
     this.disposeCallbacks.push(callback);
   }
@@ -228,7 +353,14 @@ export class PreviewPanel {
     this.panel.dispose();
   }
 
-  private getWebviewContent(html: string, css: string): string {
+  private getWebviewContent(html: string, css: string, anchor?: string): string {
+    // Detect VS Code active color theme directly
+    const themeKind = vscode.window.activeColorTheme.kind;
+    const isDark =
+      themeKind === vscode.ColorThemeKind.Dark ||
+      themeKind === vscode.ColorThemeKind.HighContrast;
+    const themeClass = isDark ? "theme-dark vscode-dark" : "theme-light vscode-light";
+
     const debugPanel = this.debugMode ? `
     <div id="debug-panel" style="position:fixed;top:0;left:0;right:0;background:#ffeb3b;color:#000;padding:10px;font-family:monospace;font-size:12px;z-index:9999;border-bottom:2px solid #f57c00;">
       Debug Mode: Click anywhere to see element info
@@ -236,10 +368,11 @@ export class PreviewPanel {
     
     const titleBar = this.currentTitle ? `
     <div class="preview-title-bar">
-      <button id="back-btn" class="preview-back-btn${this.canGoBack ? '' : ' disabled'}" onclick="if(!this.classList.contains('disabled'))vscode.postMessage({type:'navigateBack'})" title="Go back">←</button>
+      <button id="back-btn" class="preview-nav-btn${this.canGoBack ? '' : ' disabled'}" onclick="if(!this.classList.contains('disabled'))vscode.postMessage({type:'navigateBack'})" title="Go back">←</button>
+      <button id="forward-btn" class="preview-nav-btn${this.canGoForward ? '' : ' disabled'}" onclick="if(!this.classList.contains('disabled'))vscode.postMessage({type:'navigateForward'})" title="Go forward">→</button>
       <span class="preview-title-icon">📄</span>
       <span class="preview-title-text">${this.currentTitle}</span>
-      <button class="preview-refresh-btn" onclick="vscode.postMessage({type:'refresh'})" title="Refresh (restart render server)">🔄</button>
+      <button id="refresh-btn" class="preview-refresh-btn" onclick="triggerRefresh(this)" title="Refresh (re-render content)">Reload</button>
     </div>` : '';
     
     return `<!DOCTYPE html>
@@ -248,14 +381,25 @@ export class PreviewPanel {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
-    /* Base styles - white background by default */
+    /* Base styles - Map VS Code theme variables to Obsidian CSS variables */
     :root {
-      --background-primary: #ffffff;
-      --background-secondary: #f5f5f5;
-      --text-normal: #333333;
-      --text-muted: #666666;
-      --text-accent: #0969da;
-      --interactive-accent: #0550ae;
+      --background-primary: var(--vscode-editor-background, #ffffff);
+      --background-secondary: var(--vscode-sideBar-background, #f5f5f5);
+      --text-normal: var(--vscode-editor-foreground, #333333);
+      --text-muted: var(--vscode-descriptionForeground, #666666);
+      --text-accent: var(--vscode-textLink-foreground, #0969da);
+      --interactive-accent: var(--vscode-textLink-activeForeground, #0550ae);
+      --hr-color: var(--vscode-settings-dropdownListBorder, #e1e4e8);
+    }
+
+    /* Target VS Code Dark Themes */
+    body.vscode-dark, body.vscode-high-contrast {
+      --background-primary: var(--vscode-editor-background, #1e1e1e);
+      --background-secondary: var(--vscode-sideBar-background, #252526);
+      --text-normal: var(--vscode-editor-foreground, #cccccc);
+      --text-muted: var(--vscode-descriptionForeground, #858585);
+      --text-accent: var(--vscode-textLink-foreground, #3794ff);
+      --interactive-accent: var(--vscode-textLink-activeForeground, #3794ff);
     }
     
     html, body {
@@ -297,7 +441,7 @@ export class PreviewPanel {
       flex: 1;
     }
     
-    .preview-back-btn {
+    .preview-nav-btn {
       background: transparent;
       border: 1px solid var(--background-secondary);
       border-radius: 4px;
@@ -307,17 +451,17 @@ export class PreviewPanel {
       font-weight: bold;
       opacity: 0.7;
       transition: opacity 0.2s, background 0.2s, color 0.2s;
-      margin-right: 8px;
+      margin-right: 4px;
       color: var(--text-muted);
     }
     
-    .preview-back-btn:hover:not(.disabled) {
+    .preview-nav-btn:hover:not(.disabled) {
       opacity: 1;
       background: var(--background-secondary);
       color: var(--text-accent);
     }
     
-    .preview-back-btn.disabled {
+    .preview-nav-btn.disabled {
       opacity: 0.25;
       cursor: default;
     }
@@ -330,12 +474,18 @@ export class PreviewPanel {
       padding: 4px 8px;
       font-size: 14px;
       opacity: 0.6;
+      color: var(--text-normal);
       transition: opacity 0.2s;
     }
     
-    .preview-refresh-btn:hover {
+    .preview-refresh-btn:hover:not(:disabled) {
       opacity: 1;
       background: var(--background-secondary);
+    }
+
+    .preview-refresh-btn:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
     }
     
     /* Content area - scrollable */
@@ -396,15 +546,22 @@ export class PreviewPanel {
     .internal-embed {
       margin: 8px 0 !important;
     }
+
+    /* Image embeds & standalone image alignment */
+    .internal-embed-image {
+      display: inline-block !important;
+      vertical-align: middle;
+    }
     
     /* Hover preview popup */
     #hover-preview {
       position: fixed;
       display: none;
       background: var(--background-primary);
-      border: 1px solid #ccc;
+      color: var(--text-normal);
+      border: 1px solid var(--background-secondary);
       border-radius: 6px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      box-shadow: 0 4px 12px rgb(0 0 0 / 0.15);
       max-width: 400px;
       max-height: 300px;
       overflow: auto;
@@ -417,7 +574,7 @@ export class PreviewPanel {
       font-weight: bold;
       margin-bottom: 8px;
       padding-bottom: 8px;
-      border-bottom: 1px solid #eee;
+      border-bottom: 1px solid var(--background-secondary);
     }
     
     ${css}
@@ -439,7 +596,7 @@ export class PreviewPanel {
     }
   </style>
 </head>
-<body class="theme-light">
+<body class="${themeClass}">
   ${debugPanel}
   ${titleBar}
   <div class="preview-content">
@@ -451,6 +608,138 @@ export class PreviewPanel {
   <script>
     const vscode = acquireVsCodeApi();
     const isDebugMode = ${this.debugMode};
+    const initialAnchor = ${JSON.stringify(anchor || "")};
+
+    function triggerRefresh(btn) {
+      if (!btn || btn.disabled) return;
+      btn.disabled = true;
+      btn.innerText = 'Reloading...';
+      vscode.postMessage({ type: 'refresh' });
+    }
+
+    function scrollToAnchor(rawAnchor) {
+      if (!rawAnchor) {
+        return;
+      }
+
+      var decoded = decodeURIComponent(rawAnchor).trim();
+      var cleanAnchor = decoded.replace(/^#+/, '').trim();
+
+      if (!cleanAnchor) {
+        return;
+      }
+
+      var anchorLower = cleanAnchor.toLowerCase();
+      var anchorSlug = anchorLower.replace(/\\s+/g, '-');
+      var anchorNoPunct = anchorLower.replace(/[-_]+/g, ' ').replace(/[^\\w\\s\\u4e00-\\u9fa5]/g, '').trim();
+
+      // Locate and scroll to element by ID, data-heading attribute, or heading text matching anchor
+      var el = null;
+
+      var byId = document.getElementById(cleanAnchor) ||
+                 document.getElementById(anchorSlug) ||
+                 document.getElementById(anchorLower);
+      if (byId) {
+        el = byId;
+      }
+
+      if (!el) {
+        var allDataHeadings = document.querySelectorAll('[data-heading]');
+        for (var i = 0; i < allDataHeadings.length; i++) {
+          var dh = allDataHeadings[i].getAttribute('data-heading');
+          if (dh) {
+            var dhLower = dh.trim().toLowerCase();
+            var dhSlug = dhLower.replace(/\\s+/g, '-');
+            var dhNoPunct = dhLower.replace(/[-_]+/g, ' ').replace(/[^\\w\\s\\u4e00-\\u9fa5]/g, '').trim();
+            if (dhLower === anchorLower || dhSlug === anchorSlug || dhNoPunct === anchorNoPunct) {
+              el = allDataHeadings[i];
+              break;
+            }
+          }
+        }
+      }
+
+      if (!el) {
+        var headings = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
+        for (var j = 0; j < headings.length; j++) {
+          var h = headings[j];
+          var rawHText = (h.textContent || '').trim();
+          var hText = rawHText.toLowerCase();
+          var hSlug = hText.replace(/\\s+/g, '-');
+          var hNoPunct = hText.replace(/[-_]+/g, ' ').replace(/[^\\w\\s\\u4e00-\\u9fa5]/g, '').trim();
+
+          if (!el) {
+            if (hText === anchorLower || hSlug === anchorSlug || hNoPunct === anchorNoPunct || hText.indexOf(anchorLower) !== -1) {
+              el = h;
+            }
+          }
+        }
+      }
+
+      if (!el) {
+        if (isDebugMode) {
+          updateDebug('Anchor not found in preview: ' + cleanAnchor);
+        }
+        return;
+      }
+
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      if (isDebugMode) {
+        updateDebug('Scrolled preview to anchor: ' + cleanAnchor);
+      }
+
+      var container = document.querySelector('.preview-content');
+      if (!container) {
+        return;
+      }
+
+      var elRectBefore = el.getBoundingClientRect();
+      var containerRect = container.getBoundingClientRect();
+      var currentScroll = container.scrollTop;
+
+      var targetScrollCenter = currentScroll + (elRectBefore.top - containerRect.top) - (containerRect.height / 2) + (elRectBefore.height / 2);
+
+      container.scrollTo({ top: Math.max(0, targetScrollCenter), behavior: 'smooth' });
+    }
+
+    if (initialAnchor) {
+      setTimeout(function() { scrollToAnchor(initialAnchor); }, 100);
+      setTimeout(function() { scrollToAnchor(initialAnchor); }, 450);
+    }
+
+    function applyTheme(isDark) {
+      if (isDark) {
+        document.body.classList.add('theme-dark', 'vscode-dark');
+        document.body.classList.remove('theme-light', 'vscode-light');
+      } else {
+        document.body.classList.add('theme-light', 'vscode-light');
+        document.body.classList.remove('theme-dark', 'vscode-dark');
+      }
+    }
+
+    // Initial theme sync
+    applyTheme(
+      document.body.classList.contains('vscode-dark') ||
+      document.body.classList.contains('vscode-high-contrast')
+    );
+
+    // Watch for class changes made directly by VS Code on document.body
+    var themeObserver = new MutationObserver(function(mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        if (mutations[i].attributeName === 'class') {
+          var isDark = document.body.classList.contains('vscode-dark') || 
+                       document.body.classList.contains('vscode-high-contrast');
+          if (isDark && !document.body.classList.contains('theme-dark')) {
+            document.body.classList.add('theme-dark');
+            document.body.classList.remove('theme-light');
+          } else if (!isDark && !document.body.classList.contains('theme-light')) {
+            document.body.classList.add('theme-light');
+            document.body.classList.remove('theme-dark');
+          }
+        }
+      }
+    });
+    themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class'] });
     
     // Handle Admonition/Callout collapse
     function toggleAdmonition(container) {
@@ -554,34 +843,15 @@ export class PreviewPanel {
                      '" → targetPath="' + targetPath + '"');
         }
         
-        // Handle same-file anchor links (scroll within preview)
-        if (targetPath && targetPath.startsWith('#')) {
-          var anchorName = targetPath.substring(1).toLowerCase().replace(/-/g, ' ');
-          // Find matching heading in preview
-          var headings = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
-          for (var i = 0; i < headings.length; i++) {
-            var h = headings[i];
-            var headingText = (h.textContent || '').toLowerCase().trim();
-            if (headingText === anchorName || headingText.replace(/\\s+/g, '-') === targetPath.substring(1).toLowerCase()) {
-              h.scrollIntoView({ behavior: 'smooth', block: 'start' });
-              if (isDebugMode) {
-                updateDebug('Scrolled to heading: ' + h.textContent);
-              }
-              // Also notify extension to scroll editor
-              vscode.postMessage({ type: 'linkClick', targetPath: targetPath });
-              return;
+        if (targetPath) {
+          if (targetPath.indexOf('http') === 0) {
+            vscode.postMessage({ type: 'openExternal', url: targetPath });
+          } else {
+            if (targetPath.startsWith('#')) {
+              scrollToAnchor(targetPath.substring(1));
             }
+            vscode.postMessage({ type: 'linkClick', targetPath: targetPath });
           }
-          if (isDebugMode) {
-            updateDebug('Heading not found in preview: ' + anchorName);
-          }
-          // Still notify extension even if not found in preview
-          vscode.postMessage({ type: 'linkClick', targetPath: targetPath });
-          return;
-        }
-        
-        if (targetPath && targetPath.indexOf('http') !== 0) {
-          vscode.postMessage({ type: 'linkClick', targetPath: targetPath });
         }
       }
     });
@@ -594,7 +864,9 @@ export class PreviewPanel {
     // Listen for messages from extension
     window.addEventListener('message', function(e) {
       var msg = e.data;
-      if (msg.type === 'hoverPreviewResult') {
+      if (msg.type === 'scrollToAnchor') {
+        scrollToAnchor(msg.anchor);
+      } else if (msg.type === 'hoverPreviewResult') {
         showHoverPreview(msg.html, msg.x, msg.y, msg.targetPath);
       } else if (msg.type === 'updateBackButton') {
         var btn = document.getElementById('back-btn');
@@ -605,6 +877,24 @@ export class PreviewPanel {
             btn.classList.add('disabled');
           }
         }
+      } else if (msg.type === 'updateForwardButton') {
+        var btn = document.getElementById('forward-btn');
+        if (btn) {
+          if (msg.visible) {
+            btn.classList.remove('disabled');
+          } else {
+            btn.classList.add('disabled');
+          }
+        }
+      } else if (msg.type === 'refreshComplete') {
+        var btn = document.getElementById('refresh-btn');
+        if (btn) {
+          btn.disabled = false;
+          btn.innerText = 'Reload';
+        }
+      // ADD THIS BRANCH:
+      } else if (msg.type === 'themeChanged') {
+        applyTheme(msg.isDark);
       }
     });
     
@@ -654,13 +944,12 @@ export class PreviewPanel {
       currentHoverLink = null;
     }
     
-    // Add hover listeners to links
-    document.body.addEventListener('mouseenter', function(e) {
-      var link = e.target.closest('a.internal-link, a[data-href]');
+    // Add hover listeners to links (FIX: Use mouseover/mouseout which bubble)
+    document.body.addEventListener('mouseover', function(e) {
+      var link = e.target.closest('a.internal-link, a[data-href], a[href]');
       if (link && link !== currentHoverLink) {
         currentHoverLink = link;
         
-        // Delay before showing preview
         clearTimeout(hoverTimeout);
         hoverTimeout = setTimeout(function() {
           var targetPath = link.getAttribute('data-href') || link.getAttribute('href');
@@ -677,16 +966,16 @@ export class PreviewPanel {
       }
     }, true);
     
-    document.body.addEventListener('mouseleave', function(e) {
-      var link = e.target.closest('a.internal-link, a[data-href]');
+    document.body.addEventListener('mouseout', function(e) {
+      var link = e.target.closest('a.internal-link, a[data-href], a[href]');
       if (link) {
         clearTimeout(hoverTimeout);
-        // Delay before hiding to allow moving to preview
+        // Delay before hiding to allow moving pointer into preview popup
         setTimeout(function() {
-          if (!hoverPreview.matches(':hover')) {
+          if (hoverPreview && !hoverPreview.matches(':hover')) {
             hideHoverPreview();
           }
-        }, 100);
+        }, 150);
       }
     }, true);
     
