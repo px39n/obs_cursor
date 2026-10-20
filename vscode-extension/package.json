@@ -79,6 +79,11 @@
       {
         "command": "obsidian-preview.updateObsidianPlugin",
         "title": "Obsidian Preview: Update Obsidian Plugin"
+      },
+      {
+        "command": "obsidian-preview.openFileInObsidian",
+        "title": "Obsidian Preview: Open Current File in Obsidian",
+        "icon": "$(link-external)"
       }
     ],
     "keybindings": [
@@ -93,6 +98,23 @@
         {
           "when": "resourceLangId == markdown",
           "command": "obsidian-preview.open",
+          "group": "navigation"
+        },
+        {
+          "when": "resourceLangId == markdown",
+          "command": "obsidian-preview.openFileInObsidian",
+          "group": "navigation"
+        },
+        {
+          "when": "activeWebviewPanelId == 'obsidianPreview'",
+          "command": "obsidian-preview.openFileInObsidian",
+          "group": "navigation"
+        }
+      ],
+      "explorer/context": [
+        {
+          "when": "resourceLangId == markdown",
+          "command": "obsidian-preview.openFileInObsidian",
           "group": "navigation"
         }
       ]
