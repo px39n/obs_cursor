@@ -40,6 +40,7 @@ let hoverProviderDisposable: vscode.Disposable | undefined;
 let linkProviderDisposable: vscode.Disposable | undefined;
 let completionProviderDisposable: vscode.Disposable | undefined;
 let previewPanel: PreviewPanel | undefined;
+let lastPreviewedPath: string | undefined;
 const navigationStack: string[] = [];
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -392,6 +393,14 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   );
 
+  // Command: Open current file in Obsidian
+  const openFileInObsidianCommand = vscode.commands.registerCommand(
+    "obsidian-preview.openFileInObsidian",
+    async (uri?: vscode.Uri) => {
+      await openFileInObsidian(uri);
+    }
+  );
+
   // Command: Update vault path
   const updateVaultPathCommand = vscode.commands.registerCommand(
     "obsidian-preview.updateVaultPath",
@@ -426,6 +435,7 @@ export function activate(context: vscode.ExtensionContext): void {
     pasteImgurCommand,
     editorChangeDisposable,
     openObsidianCommand,
+    openFileInObsidianCommand,
     updateVaultPathCommand,
     updatePluginCommand
   );
@@ -440,6 +450,7 @@ async function updatePreview(document: vscode.TextDocument): Promise<void> {
   if (!previewPanel || !client.isConnected()) return;
 
   const filePath = document.uri.fsPath;
+  lastPreviewedPath = filePath;
   const content = document.getText();
   // Extract filename without extension for title
   const fileName = filePath.split(/[/\\]/).pop()?.replace(/\.md$/i, '') || '';
@@ -1216,6 +1227,32 @@ async function openObsidianVault(): Promise<void> {
     vscode.window.showInformationMessage(`Opening Obsidian vault: ${vaultName}`);
   } catch (err) {
     vscode.window.showErrorMessage(`Failed to open Obsidian: ${err}`);
+  }
+}
+
+/**
+ * Open a file in Obsidian. obsidian://open?path= resolves the vault from the absolute path.
+ */
+async function openFileInObsidian(uri?: vscode.Uri): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  const filePath =
+    (uri?.scheme === "file" ? uri.fsPath : undefined) ??
+    (editor?.document.languageId === "markdown" ? editor.document.uri.fsPath : undefined) ??
+    lastPreviewedPath;
+
+  if (!filePath) {
+    vscode.window.showWarningMessage("Open or preview a Markdown file first.");
+    return;
+  }
+
+  // Pass a string: a vscode.Uri re-encodes the query and breaks paths containing "&".
+  const target = `obsidian://open?path=${encodeURIComponent(filePath)}`;
+
+  try {
+    await vscode.env.openExternal(target as unknown as vscode.Uri);
+    logger.info(`Opened in Obsidian: ${filePath}`);
+  } catch (err) {
+    vscode.window.showErrorMessage(`Failed to open in Obsidian: ${err}`);
   }
 }
 
